@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -78,9 +79,12 @@ class Episode:
 class EpisodeStore:
     """JSON episode files keep the initial store inspectable and dependency-free."""
 
-    def __init__(self, root: str | Path, worker_id: str | None = None) -> None:
-        self.root = (Path(root) / (worker_id or "shared")).resolve()
+    def __init__(self, root: str | Path, worker_id: str | None = None, task_id: str | None = None) -> None:
+        base = Path(root).resolve()
+        self.root = base / "tasks" / (task_id or "_unbound") / (worker_id or "default")
+        self.experience_root = base / "experience"
         self.root.mkdir(parents=True, exist_ok=True)
+        self.experience_root.mkdir(parents=True, exist_ok=True)
 
     def store_candidate(self, episode: Episode) -> Path:
         if episode.human_review not in {"APPROVED", "REJECTED", "PENDING"}:
@@ -103,6 +107,25 @@ class EpisodeStore:
                 os.unlink(temp_name)
         return path
 
+    def store_experience(self, episode: Episode) -> Path:
+        if episode.human_review != "APPROVED" or episode.ci_result not in {"VALIDATION_PASS", "PASS"}:
+            raise ValueError("shared experience requires human approval and a passing validation result")
+        path = self.experience_root / f"{episode.episode_id}.json"
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", episode.episode_id):
+            raise ValueError("episode_id must be a simple file name")
+        payload = canonical_json(episode)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=self.experience_root)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+        return path
+
     def retrieve(
         self,
         *,
@@ -112,14 +135,22 @@ class EpisodeStore:
         keywords: tuple[str, ...],
         source_commit: str,
         limit: int = 5,
+        deadline: float | None = None,
     ) -> tuple[Episode, ...]:
         scored: list[tuple[int, Episode]] = []
         wanted = {word.lower() for word in keywords if word}
-        for path in sorted(self.root.glob("*.json")):
+        paths = sorted(set(self.root.glob("*.json")) | set(self.experience_root.glob("*.json")))
+        for path in paths:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("memory retrieval stopped at the workspace deadline")
             try:
+                if path.stat().st_size > 256_000:
+                    continue
                 episode = Episode(**json.loads(path.read_text(encoding="utf-8")))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("memory retrieval stopped at the workspace deadline")
             if episode.repo != repo or (module and episode.module not in {module, "*"}) or (rule and episode.rule not in {rule, "*"}):
                 continue
             if source_commit and episode.source_commit != source_commit:

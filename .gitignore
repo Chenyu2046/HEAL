@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 .venv/
 build/
+cmake-build-*/
+coverage/
+*.o
+*.a
 dist/
 *.egg-info/
 /output/

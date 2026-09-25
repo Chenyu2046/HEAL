@@ -6,7 +6,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..domain import Candidate, ValidationClass, ValidationResult
+from ..domain import Candidate, ValidationClass, ValidationResult, ValidationState
+from ..runtime.trace import sanitize
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,8 @@ class IndependentValidator:
             classification = ValidationClass.INCONCLUSIVE
         elif actual_tested_commit is None:
             classification = ValidationClass.INCONCLUSIVE
+        elif not candidate.candidate_commit or actual_tested_commit != candidate.candidate_commit:
+            classification = ValidationClass.INCONCLUSIVE
         elif any(check not in checks for check in self.policy.required_checks):
             classification = ValidationClass.INCONCLUSIVE
         elif any(str(checks.get(check, "")).upper() in {"INFRA_FAIL", "INFRA", "TIMEOUT_INFRA"} for check in self.policy.required_checks):
@@ -60,5 +63,7 @@ class IndependentValidator:
             backend=backend,
             classification=classification,
             checks=dict(checks),
-            evidence=dict(evidence or {}),
+            evidence=sanitize(dict(evidence or {})),
+            state=ValidationState.FINAL,
+            candidate_commit=candidate.candidate_commit,
         )

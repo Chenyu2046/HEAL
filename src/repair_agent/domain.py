@@ -88,6 +88,8 @@ class Stage(StrEnum):
     CANDIDATE_FROZEN = "CANDIDATE_FROZEN"
     HUMAN_REVIEW = "HUMAN_REVIEW"
     SUBMITTING = "SUBMITTING"
+    CI_DISPATCHING = "CI_DISPATCHING"
+    CI_DISPATCH_UNKNOWN = "CI_DISPATCH_UNKNOWN"
     CI_PENDING = "CI_PENDING"
     VERIFIED = "VERIFIED"
     REVIEW_REQUIRED = "REVIEW_REQUIRED"
@@ -121,6 +123,12 @@ class ValidationClass(StrEnum):
     CODE_FAIL = "CODE_FAIL"
     INFRA_FAIL = "INFRA_FAIL"
     INCONCLUSIVE = "INCONCLUSIVE"
+
+
+class ValidationState(StrEnum):
+    UNKNOWN = "UNKNOWN"
+    PARTIAL = "PARTIAL"
+    FINAL = "FINAL"
 
 
 class SubmissionStatus(StrEnum):
@@ -243,6 +251,13 @@ class Budget:
     max_tokens: int = 100_000
     max_wall_seconds: float = 900.0
     max_edit_attempts: int = 20
+    max_chunk_actions: int = 8
+
+    def __post_init__(self) -> None:
+        if min(self.max_model_calls, self.max_tool_calls, self.max_tokens, self.max_edit_attempts) < 0 or self.max_wall_seconds <= 0:
+            raise ValueError("execution budgets must be non-negative and wall time must be positive")
+        if not 1 <= self.max_chunk_actions <= 8:
+            raise ValueError("max_chunk_actions must be between 1 and 8")
 
 
 @dataclass(frozen=True)
@@ -308,6 +323,8 @@ class Candidate:
     report_hash: str
     changed_files: tuple[str, ...]
     finding_ids: tuple[str, ...]
+    git_tree_oid: str = ""
+    candidate_commit: str = ""
     suppression_candidate_ids: tuple[str, ...] = ()
     created_at: str = field(default_factory=utc_now)
     valid: bool = True
@@ -321,6 +338,8 @@ class HumanApproval:
     reviewer: str
     reason: str
     created_at: str = field(default_factory=utc_now)
+    git_tree_oid: str = ""
+    candidate_commit: str = ""
 
 
 @dataclass(frozen=True)
@@ -331,11 +350,18 @@ class SubmissionIntent:
     repo: str
     branch: str
     change_id: str
-    fixed_commit: str
+    candidate_commit: str
+    candidate_git_tree_oid: str = ""
     status: SubmissionStatus = SubmissionStatus.INTENT_RECORDED
     remote_change: str | None = None
     patch_set: str | None = None
     created_at: str = field(default_factory=utc_now)
+    fixed_commit: str | None = None
+
+    def __post_init__(self) -> None:
+        # Read compatibility for existing adapter code and stored v1 intents.
+        if self.fixed_commit is None:
+            object.__setattr__(self, "fixed_commit", self.candidate_commit)
 
 
 @dataclass(frozen=True)
@@ -353,6 +379,8 @@ class ValidationResult:
     evidence: Mapping[str, Any] = field(default_factory=dict)
     duplicate: bool = False
     created_at: str = field(default_factory=utc_now)
+    state: ValidationState = ValidationState.FINAL
+    candidate_commit: str = ""
 
 
 @dataclass(frozen=True)
@@ -410,16 +438,18 @@ def has_protected_name(path: str) -> bool:
     return any(part in protected_dirs or part.endswith(".lock") or part == "lockfile" for part in parts)
 
 
+_JSON_SECRET_PATTERN = re.compile(r'''(?i)((?:"?(?:api[_-]?key|apikey|password|passphrase|secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|token|credential|authorization)"?)\s*:\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}]+)''')
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,;]+"),
     re.compile(r"(?i)(password\s*[:=]\s*)[^\s,;]+"),
     re.compile(r"(?i)(token\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)((?:client[_-]?secret|access[_-]?token|refresh[_-]?token|credential)\s*[:=]\s*)[^\s,;]+"),
 )
 
 
 def redact_text(value: str) -> str:
-    result = value
+    result = _JSON_SECRET_PATTERN.sub(r'\1"<redacted>"', value)
     for pattern in _SECRET_PATTERNS:
         result = pattern.sub(r"\1<redacted>", result)
     return result

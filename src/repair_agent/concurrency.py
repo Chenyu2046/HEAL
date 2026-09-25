@@ -40,6 +40,7 @@ class IntegrationResult:
     semantic_warnings: tuple[str, ...] = ()
     changed_files: tuple[str, ...] = ()
     message: str = ""
+    conflicting_batches: tuple[str, ...] = ()
 
 
 class IntegrationEngine:
@@ -48,6 +49,7 @@ class IntegrationEngine:
     def integrate(self, workspace: Path, proposals: Sequence[object]) -> IntegrationResult:
         seen_files: dict[str, str] = {}
         conflicts: list[str] = []
+        conflicting_batches: set[str] = set()
         semantic_warnings: list[str] = []
         all_files: set[str] = set()
         for proposal in proposals:
@@ -55,6 +57,7 @@ class IntegrationEngine:
                 all_files.add(path)
                 if path in seen_files:
                     conflicts.append(f"file overlap: {path} ({seen_files[path]} and {proposal.batch_id})")
+                    conflicting_batches.update((seen_files[path], proposal.batch_id))
                 seen_files[path] = proposal.batch_id
                 if path.endswith((".h", ".hpp", ".hh", ".inl")):
                     semantic_warnings.append(f"public/header dependency requires semantic review: {path}")
@@ -62,7 +65,7 @@ class IntegrationEngine:
             if any(marker in diff.lower() for marker in ("mutex", "atomic", "lifecycle", "shared_state")):
                 semantic_warnings.append(f"semantic shared-state review required for batch {proposal.batch_id}")
         if conflicts:
-            return IntegrationResult(False, tuple(sorted(set(conflicts))), tuple(sorted(set(semantic_warnings))), tuple(sorted(all_files)), "known conflict blocks serial integration")
+            return IntegrationResult(False, tuple(sorted(set(conflicts))), tuple(sorted(set(semantic_warnings))), tuple(sorted(all_files)), "known conflict blocks serial integration", tuple(sorted(conflicting_batches)))
         for proposal in proposals:
             diff = str(getattr(proposal, "diff", ""))
             if not diff:
@@ -71,8 +74,7 @@ class IntegrationEngine:
                 result = subprocess.run(
                     ["git", "apply", "--binary", "--whitespace=nowarn", "--"],
                     cwd=workspace,
-                    input=diff,
-                    text=True,
+                    input=diff.encode("utf-8"),
                     capture_output=True,
                     check=False,
                     timeout=120,
@@ -80,7 +82,8 @@ class IntegrationEngine:
             except (OSError, subprocess.TimeoutExpired) as exc:
                 return IntegrationResult(False, (f"integration tool failure: {exc}",), tuple(sorted(set(semantic_warnings))), tuple(sorted(all_files)), "git apply failed")
             if result.returncode != 0:
-                return IntegrationResult(False, (result.stderr.strip() or "git apply rejected worker diff",), tuple(sorted(set(semantic_warnings))), tuple(sorted(all_files)), "worker diff could not be applied")
+                error = result.stderr.decode("utf-8", errors="replace").strip() or "git apply rejected worker diff"
+                return IntegrationResult(False, (error,), tuple(sorted(set(semantic_warnings))), tuple(sorted(all_files)), "worker diff could not be applied", (str(getattr(proposal, "batch_id", "")),))
         return IntegrationResult(True, (), tuple(sorted(set(semantic_warnings))), tuple(sorted(all_files)), "integrated serially; semantic independence remains a review obligation")
 
 

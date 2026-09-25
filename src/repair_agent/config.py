@@ -49,12 +49,19 @@ class Config:
     tools: ToolLimits = field(default_factory=ToolLimits)
     model: ModelConfig = field(default_factory=ModelConfig)
     protected_paths: tuple[str, ...] = (".git", ".repair-agent", "third_party", "vendor", "dependencies", "ci", ".github")
+    max_recent_observations: int = 10
+    max_observation_chars: int = 4_000
+    max_skill_context_chars: int = 12_000
+    max_skill_scan_bytes: int = 512_000
 
     def __post_init__(self) -> None:
         if self.mode not in {"local-demo", "simulated-enterprise", "enterprise"}:
             raise ConfigError(f"unsupported mode: {self.mode}")
         if self.max_workers < 1:
             raise ConfigError("max_workers must be positive")
+        if (self.model.max_retries < 0 or self.max_recent_observations < 1 or self.max_observation_chars < 1
+                or self.max_skill_context_chars < 1 or self.max_skill_scan_bytes < 1):
+            raise ConfigError("retry and context limits are invalid")
 
 
 def _budget(value: Mapping[str, Any] | None) -> Budget:
@@ -65,6 +72,7 @@ def _budget(value: Mapping[str, Any] | None) -> Budget:
         max_tokens=int(value.get("max_tokens", 100_000)),
         max_wall_seconds=float(value.get("max_wall_seconds", 900.0)),
         max_edit_attempts=int(value.get("max_edit_attempts", 20)),
+        max_chunk_actions=int(value.get("max_chunk_actions", 8)),
     )
 
 
@@ -107,4 +115,8 @@ def load_config(path: str | Path | None = None) -> Config:
         tools=ToolLimits(**tool_values),
         model=ModelConfig(**model_values),
         protected_paths=tuple(str(item) for item in raw.get("protected_paths", Config().protected_paths)),
+        max_recent_observations=int(raw.get("max_recent_observations", 10)),
+        max_observation_chars=int(raw.get("max_observation_chars", 4_000)),
+        max_skill_context_chars=int(raw.get("max_skill_context_chars", 12_000)),
+        max_skill_scan_bytes=int(raw.get("max_skill_scan_bytes", 512_000)),
     )

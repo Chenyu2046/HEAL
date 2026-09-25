@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,11 +22,17 @@ class SkillRecord:
     risks: tuple[RiskClass, ...] = ()
 
 
+class SkillContextError(ValueError):
+    """Skill discovery exceeded an explicit resource bound."""
+
+
 class SkillStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root).resolve()
 
-    def load(self, skill_id: str) -> SkillRecord:
+    def load(self, skill_id: str, *, max_bytes: int | None = None, deadline: float | None = None) -> SkillRecord:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("skill read stopped at the workspace deadline")
         relative = Path(skill_id)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError(f"skill id escapes skill root: {skill_id}")
@@ -34,7 +41,14 @@ class SkillStore:
         path = next((candidate for candidate in candidates if candidate.is_file()), None)
         if path is None:
             raise FileNotFoundError(f"skill not found: {skill_id}")
-        content_bytes = path.read_bytes()
+        if max_bytes is not None and path.stat().st_size > max_bytes:
+            raise ValueError(f"skill exceeds read limit: {max_bytes} bytes")
+        with path.open("rb") as stream:
+            content_bytes = stream.read(max_bytes + 1 if max_bytes is not None else -1)
+        if max_bytes is not None and len(content_bytes) > max_bytes:
+            raise ValueError(f"skill exceeds read limit: {max_bytes} bytes")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("skill read stopped at the workspace deadline")
         content = content_bytes.decode("utf-8")
         metadata = self._metadata(content)
         return SkillRecord(
@@ -61,24 +75,68 @@ class SkillRouter:
     def __init__(self, store: SkillStore) -> None:
         self.store = store
 
-    def route(self, issue: Issue) -> tuple[SkillRecord, ...]:
+    def route_many(
+        self,
+        issues: tuple[Issue, ...] | list[Issue],
+        *,
+        max_skill_bytes: int = 256_000,
+        max_scan_bytes: int = 512_000,
+        max_context_chars: int = 12_000,
+        deadline: float | None = None,
+    ) -> tuple[SkillRecord, ...]:
         if not self.store.root.is_dir():
             return ()
-        rule = str(getattr(issue, "rule_id", getattr(issue, "test_id", ""))).lower()
-        module = str(getattr(issue, "module", "") or "").lower()
-        risk = getattr(issue, "risk", RiskClass.UNKNOWN)
-        results: list[SkillRecord] = []
-        for path in sorted(self.store.root.rglob("*.md")):
-            skill_id = path.relative_to(self.store.root).with_suffix("").as_posix()
-            try:
-                skill = self.store.load(skill_id)
-            except (OSError, UnicodeError, ValueError):
-                continue
-            metadata_hit = rule in {item.lower() for item in skill.rule_ids} or module in {item.lower() for item in skill.modules} or risk in skill.risks
-            filename_hit = rule and rule in skill_id.lower() or module and module in skill_id.lower()
-            if metadata_hit or filename_hit or skill_id == "default":
-                results.append(skill)
-        return tuple(results)
+        signals = tuple((
+            str(getattr(issue, "rule_id", getattr(issue, "test_id", ""))).lower(),
+            str(getattr(issue, "module", "") or "").lower(),
+            getattr(issue, "risk", RiskClass.UNKNOWN),
+        ) for issue in issues)
+        results: dict[tuple[str, str, str], SkillRecord] = {}
+        scanned_bytes = 0
+        context_chars = 0
+        try:
+            paths = self.store.root.rglob("*.md")
+            for path in paths:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise SkillContextError("skill context deadline exceeded")
+                size = path.stat().st_size
+                if size > max_skill_bytes:
+                    raise SkillContextError("skill file exceeds configured byte limit")
+                if scanned_bytes + size > max_scan_bytes:
+                    raise SkillContextError("skill scan exceeds configured byte limit")
+                skill_id = path.relative_to(self.store.root).with_suffix("").as_posix()
+                skill = self.store.load(skill_id, max_bytes=max_skill_bytes, deadline=deadline)
+                scanned_bytes += len(skill.content.encode("utf-8"))
+                if scanned_bytes > max_scan_bytes:
+                    raise SkillContextError("skill scan exceeds configured byte limit")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise SkillContextError("skill context deadline exceeded")
+                rule_ids = {item.lower() for item in skill.rule_ids}
+                modules = {item.lower() for item in skill.modules}
+                if not any(
+                    (rule and (rule in rule_ids or rule in skill_id.lower()))
+                    or (module and (module in modules or module in skill_id.lower()))
+                    or risk in skill.risks
+                    or skill_id == "default"
+                    for rule, module, risk in signals
+                ):
+                    continue
+                key = (skill.skill_id, skill.version, skill.content_hash)
+                if key in results:
+                    continue
+                rendered_chars = len(f"[Skill {skill.skill_id} v{skill.version} from {skill.source}]\n{skill.content}")
+                context_chars += rendered_chars
+                if context_chars > max_context_chars:
+                    raise SkillContextError("skill context exceeds configured character limit")
+                results[key] = skill
+        except SkillContextError:
+            raise
+        except (OSError, UnicodeError, ValueError, TimeoutError) as exc:
+            raise SkillContextError("skill context could not be loaded completely") from exc
+        return tuple(results[key] for key in sorted(results))
+
+    def route(self, issue: Issue) -> tuple[SkillRecord, ...]:
+        return self.route_many((issue,))
 
     def inject(self, issue: Issue) -> str:
         skills = self.route(issue)

@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from ..domain import Candidate, ValidationResult, redact_text
-from ..runtime.workspace import tree_hash
+from ..runtime.workspace import WorkspaceError, git_tree_oid, tree_hash
+from .candidate import CandidateError, CandidateFreezer
 from .results import IndependentValidator
 
 
@@ -25,7 +26,17 @@ class LocalValidator:
         self.classifier = classifier or IndependentValidator()
 
     def run(self, *, candidate: Candidate, workspace: Path, commit: str, config_id: str, commands: Mapping[str, CommandSpec]) -> ValidationResult:
-        before = tree_hash(workspace)
+        try:
+            before = tree_hash(workspace)
+            current_tree_oid = git_tree_oid(workspace)
+        except (OSError, WorkspaceError) as exc:
+            return self.classifier.classify(candidate=candidate, revision=commit, actual_tested_commit=commit, ci_run_id=f"local-{uuid.uuid4().hex}", config_id=config_id, backend="local", checks={"workspace_integrity": "IDENTITY_MISMATCH"}, evidence={"identity_error": str(exc)})
+        if before != candidate.tree_hash or current_tree_oid != candidate.git_tree_oid or commit != candidate.candidate_commit:
+            return self.classifier.classify(candidate=candidate, revision=commit, actual_tested_commit=commit, ci_run_id=f"local-{uuid.uuid4().hex}", config_id=config_id, backend="local", checks={"workspace_integrity": "IDENTITY_MISMATCH"}, evidence={"identity_error": "local validation workspace or commit does not match the frozen candidate"})
+        try:
+            CandidateFreezer.assert_commit_identity(candidate, workspace, commit)
+        except (OSError, WorkspaceError, CandidateError) as exc:
+            return self.classifier.classify(candidate=candidate, revision=commit, actual_tested_commit=commit, ci_run_id=f"local-{uuid.uuid4().hex}", config_id=config_id, backend="local", checks={"workspace_integrity": "IDENTITY_MISMATCH"}, evidence={"identity_error": str(exc)})
         checks: dict[str, str] = {}
         evidence: dict[str, object] = {"backend": "local", "commands": {name: list(spec.argv) for name, spec in commands.items()}}
         for name in ("build", "ut", "scan"):
@@ -46,8 +57,14 @@ class LocalValidator:
                 continue
             checks[name] = "PASS" if result.returncode == 0 else "FAIL"
             evidence[name] = {"returncode": result.returncode, "elapsed_ms": int((time.monotonic() - started) * 1000), "stdout": redact_text(result.stdout[-2000:]), "stderr": redact_text(result.stderr[-2000:])}
-        after = tree_hash(workspace)
-        if before != after:
+        try:
+            after = tree_hash(workspace)
+            after_oid = git_tree_oid(workspace)
+        except (OSError, WorkspaceError) as exc:
+            checks["workspace_integrity"] = "FAIL"
+            evidence["workspace_integrity"] = f"could not verify source tree after checks: {exc}"
+            after, after_oid = "", ""
+        if before != after or current_tree_oid != after_oid:
             checks["workspace_integrity"] = "FAIL"
             evidence["workspace_integrity"] = "validator command modified source tree"
         return self.classifier.classify(candidate=candidate, revision=commit, actual_tested_commit=commit, ci_run_id=f"local-{uuid.uuid4().hex}", config_id=config_id, backend="local", checks=checks, evidence=evidence)

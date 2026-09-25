@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 from .domain import (
@@ -35,11 +36,14 @@ class NormalizedInput:
 class InputNormalizer:
     """Accept only the documented JSON shape; unknown logs fail explicitly."""
 
-    def normalize(self, payload: Mapping[str, Any], *, default_repo: str | None = None) -> NormalizedInput:
+    def normalize(self, payload: Mapping[str, Any], *, default_repo: str | None = None, default_budget: Budget | None = None, default_mode: str = "local-demo", default_model_id: str = "unknown", cli_budget_overrides: Mapping[str, Any] | None = None) -> NormalizedInput:
         if not isinstance(payload, Mapping):
             raise InputFormatError("task input must be a JSON object")
         task_id = str(payload.get("task_id", payload.get("id", ""))).strip()
         run_id = str(payload.get("run_id", "")).strip()
+        safe_id = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+        if not safe_id.fullmatch(task_id) or (run_id and not safe_id.fullmatch(run_id)):
+            raise InputFormatError("task_id and run_id must be 1-128 safe filename characters")
         repo = str(payload.get("repo", default_repo or "")).strip()
         base_commit = str(payload.get("base_commit", "")).strip()
         if not task_id or not repo or not base_commit:
@@ -54,6 +58,7 @@ class InputNormalizer:
         issues: list[Issue] = []
         warnings: list[str] = []
         seen: dict[tuple[str, str], str] = {}
+        source_by_id: dict[str, str] = {}
         for raw in raw_issues:
             if not isinstance(raw, Mapping):
                 raise InputFormatError("each issue must be an object")
@@ -69,14 +74,17 @@ class InputNormalizer:
             except (TypeError, ValueError) as exc:
                 raise InputFormatError(f"invalid {source} issue: {exc}") from exc
             key = (source, issue_id(issue))
+            prior_source = source_by_id.get(issue_id(issue))
+            if prior_source is not None and prior_source != source:
+                raise InputFormatError(f"issue id is ambiguous across sources: {issue_id(issue)}")
             serialized = repr(issue)
             if key in seen:
                 if seen[key] != serialized:
-                    warnings.append(f"duplicate identity with conflicting payload: {source}:{issue_id(issue)}")
-                else:
-                    warnings.append(f"duplicate removed: {source}:{issue_id(issue)}")
+                    raise InputFormatError(f"conflicting duplicate identity: {source}:{issue_id(issue)}")
+                warnings.append(f"duplicate removed: {source}:{issue_id(issue)}")
                 continue
             seen[key] = serialized
+            source_by_id[issue_id(issue)] = source
             if isinstance(issue, Finding):
                 issue = replace(issue, risk=classify_risk(issue))
             elif isinstance(issue, UTFailure):
@@ -86,6 +94,16 @@ class InputNormalizer:
         raw_budget = payload.get("budget") or {}
         if not isinstance(raw_budget, Mapping):
             raise InputFormatError("budget must be an object")
+        resolved_budget = {
+            "max_model_calls": (default_budget or Budget()).max_model_calls,
+            "max_tool_calls": (default_budget or Budget()).max_tool_calls,
+            "max_tokens": (default_budget or Budget()).max_tokens,
+            "max_wall_seconds": (default_budget or Budget()).max_wall_seconds,
+            "max_edit_attempts": (default_budget or Budget()).max_edit_attempts,
+            "max_chunk_actions": (default_budget or Budget()).max_chunk_actions,
+        }
+        resolved_budget.update(raw_budget)
+        resolved_budget.update({key: value for key, value in (cli_budget_overrides or {}).items() if value is not None})
         task = RepairTask(
             task_id=task_id,
             run_id=run_id or sha256_text(f"{task_id}:{base_commit}")[:16],
@@ -94,14 +112,15 @@ class InputNormalizer:
             issues=tuple(issues),
             risk_policy=str(payload.get("risk_policy", "default")),
             budget=Budget(
-                max_model_calls=int(raw_budget.get("max_model_calls", 20)),
-                max_tool_calls=int(raw_budget.get("max_tool_calls", 100)),
-                max_tokens=int(raw_budget.get("max_tokens", 100_000)),
-                max_wall_seconds=float(raw_budget.get("max_wall_seconds", 900.0)),
-                max_edit_attempts=int(raw_budget.get("max_edit_attempts", 20)),
+                max_model_calls=int(resolved_budget["max_model_calls"]),
+                max_tool_calls=int(resolved_budget["max_tool_calls"]),
+                max_tokens=int(resolved_budget["max_tokens"]),
+                max_wall_seconds=float(resolved_budget["max_wall_seconds"]),
+                max_edit_attempts=int(resolved_budget["max_edit_attempts"]),
+                max_chunk_actions=int(resolved_budget["max_chunk_actions"]),
             ),
-            mode=str(payload.get("mode", "local-demo")),
-            model_id=str(payload.get("model_id", "unknown")),
+            mode=str(payload.get("mode", default_mode)),
+            model_id=str(payload.get("model_id", default_model_id)),
         )
         return NormalizedInput(task=task, warnings=tuple(warnings))
 
@@ -132,29 +151,36 @@ class BatchPlanner:
             symbol = getattr(issue, "symbol", None) or "<unknown-symbol>"
             lifecycle = getattr(issue, "lifecycle_domain", None) or "<unknown-lifecycle>"
             key = (module, symbol, lifecycle)
-            group = groups.setdefault(key, [])
-            files = {issue_file(item) for item in group if issue_file(item)}
-            if group and (len(group) >= self.max_issues or (issue_file(issue) and len(files | {issue_file(issue)}) > self.max_files)):
-                key = (module, f"{symbol}#{len(groups)}", lifecycle)
-                group = groups.setdefault(key, [])
-            group.append(issue)
+            groups.setdefault(key, []).append(issue)
 
         batches: list[WorkingBatch] = []
-        for index, (affinity, issues) in enumerate(groups.items(), 1):
-            risks = {classify_risk(issue) for issue in issues}
-            risk = RiskClass.HIGH if RiskClass.HIGH in risks else RiskClass.MEDIUM if RiskClass.MEDIUM in risks else RiskClass.LOW
-            batches.append(
-                WorkingBatch(
-                    batch_id=f"{task.task_id}-batch-{index}",
-                    task_id=task.task_id,
-                    issues=tuple(issues),
-                    affinity_key=affinity,
+        for affinity, group in groups.items():
+            chunks: list[list[Issue]] = []
+            chunk: list[Issue] = []
+            files: set[str] = set()
+            for issue in group:
+                issue_path = issue_file(issue)
+                next_files = files | ({issue_path} if issue_path else set())
+                if chunk and (len(chunk) >= self.max_issues or len(next_files) > self.max_files):
+                    chunks.append(chunk)
+                    chunk, files = [], set()
+                chunk.append(issue)
+                if issue_path:
+                    files.add(issue_path)
+            if chunk:
+                chunks.append(chunk)
+            for issues in chunks:
+                risks = {classify_risk(issue) for issue in issues}
+                risk = RiskClass.HIGH if RiskClass.HIGH in risks else RiskClass.MEDIUM if RiskClass.MEDIUM in risks else RiskClass.LOW
+                index = len(batches) + 1
+                batches.append(WorkingBatch(
+                    batch_id=f"{task.task_id}-batch-{index}", task_id=task.task_id,
+                    issues=tuple(issues), affinity_key=affinity,
                     known_files=frozenset(issue_file(issue) for issue in issues if issue_file(issue)),
                     known_symbols=frozenset(getattr(issue, "symbol", None) for issue in issues if getattr(issue, "symbol", None)),
                     lifecycle_domains=frozenset(getattr(issue, "lifecycle_domain", None) for issue in issues if getattr(issue, "lifecycle_domain", None)),
                     risk=risk,
-                )
-            )
+                ))
         return tuple(batches)
 
     @staticmethod

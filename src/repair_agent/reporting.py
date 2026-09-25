@@ -8,17 +8,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
-from .domain import canonical_json, redact_text, to_primitive
+from .runtime.trace import sanitize
 
 
 def _redact(value: Any) -> Any:
-    if isinstance(value, str):
-        return redact_text(value)
-    if isinstance(value, dict):
-        return {key: _redact(item) for key, item in value.items() if str(key).lower() not in {"api_key", "authorization", "password", "secret"}}
-    if isinstance(value, (tuple, list)):
-        return [_redact(item) for item in value]
-    return to_primitive(value)
+    return sanitize(value)
 
 
 class ReportWriter:
@@ -47,12 +41,25 @@ class ReportWriter:
 
     def _markdown(self, report: Mapping[str, Any]) -> str:
         lines = [f"# Harman Code Quality Agent Report", "", f"- Run: `{report.get('run_id', 'unknown')}`", f"- Stage: `{report.get('stage', 'unknown')}`", f"- Candidate: `{report.get('candidate_id', 'none')}`", ""]
+        budget = report.get("budget_used", {})
+        if isinstance(budget, Mapping):
+            if bool(budget.get("token_usage_known", True)):
+                lines.append(f"- Model tokens used: `{budget.get('tokens', 0)}`")
+            else:
+                lines.append("- Model token usage: `UNKNOWN`; further model work is blocked to preserve the budget")
+            lines.append("")
         sections = (
-            ("Candidate patches", "candidate_patches"),
+            ("Candidate patches (not verified fixes)", "candidate_patches"),
+            ("Human approvals", "human_approvals"),
             ("Validation passed", "validation_passed"),
+            ("Code failures", "validation_code_fail"),
+            ("Validation infrastructure failures", "validation_infrastructure"),
+            ("Inconclusive validation", "validation_inconclusive"),
+            ("Validation pending / partial", "validation_pending"),
             ("Approved suppression candidates", "approved_suppressions"),
             ("Unresolved", "unresolved"),
             ("Not executed", "not_executed"),
+            ("Checks not run", "checks_not_run"),
             ("Infrastructure / configuration", "infrastructure"),
         )
         for title, key in sections:

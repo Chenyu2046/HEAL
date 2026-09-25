@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from ..config import ToolLimits
-from ..domain import Observation, ToolStatus
+from ..domain import Observation, ToolStatus, canonical_json
 from ..memory import EpisodeStore
 from ..models import ToolCall
 from ..runtime.workspace import WorkspaceState
@@ -28,9 +28,31 @@ class ToolSpec:
     read_only: bool
     required_args: tuple[str, ...] = ()
     allowed_in_chunk: bool = False
+    properties: Mapping[str, Any] = field(default_factory=dict)
 
     def schema(self) -> dict[str, Any]:
-        return {"type": "function", "function": {"name": self.name, "description": self.description, "parameters": {"type": "object", "additionalProperties": True, "required": list(self.required_args)}}}
+        return {"type": "function", "function": {"name": self.name, "description": self.description, "parameters": {"type": "object", "properties": dict(self.properties or {}), "additionalProperties": False, "required": list(self.required_args)}}}
+
+    def validation_error(self, arguments: Mapping[str, Any]) -> str | None:
+        missing = [key for key in self.required_args if key not in arguments]
+        if missing:
+            return f"missing arguments: {', '.join(missing)}"
+        unknown = set(arguments) - set(self.properties)
+        if unknown:
+            return f"unsupported arguments: {', '.join(sorted(unknown))}"
+        for key, value in arguments.items():
+            schema = self.properties[key]
+            expected = schema.get("type")
+            valid = {
+                "string": lambda item: isinstance(item, str),
+                "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+                "array": lambda item: isinstance(item, list) and all(isinstance(element, str) for element in item),
+            }.get(expected, lambda item: True)(value)
+            if not valid or ("minimum" in schema and value < schema["minimum"]) or ("maximum" in schema and value > schema["maximum"]):
+                return f"invalid argument: {key}"
+            if "minLength" in schema and not value.strip():
+                return f"invalid argument: {key}"
+        return None
 
 
 class ToolRegistry:
@@ -70,22 +92,22 @@ class ToolExecutor:
         self._handlers: dict[str, Handler] = {}
         source = SourceTools(workspace, max_file_bytes=self.limits.max_file_bytes, max_output_chars=self.limits.max_output_chars, max_search_results=self.limits.max_search_results)
         edit = EditTool(workspace, max_file_bytes=self.limits.max_file_bytes)
-        self._register(ToolSpec("read_file", "Read a bounded UTF-8 source range.", True, ("path",), True), source.read_file)
-        self._register(ToolSpec("search_code", "Text search only; not complete C++ semantic navigation.", True, ("query",), True), source.search_code)
-        self._register(ToolSpec("find_definition", "Semantic definition lookup when clangd is configured.", True, ("symbol",), True), source.unsupported_navigation)
-        self._register(ToolSpec("find_references", "Semantic reference lookup when clangd is configured.", True, ("symbol",), True), source.unsupported_navigation)
-        self._register(ToolSpec("edit_file", "Replace one uniquely matched old text after hash validation.", False, ("path", "expected_hash", "old_text", "new_text")), edit.edit_file)
+        self._register(ToolSpec("read_file", "Read a bounded UTF-8 source range.", True, ("path",), True, {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}, "max_chars": {"type": "integer", "minimum": 1}}), source.read_file)
+        self._register(ToolSpec("search_code", "Text search only; not complete C++ semantic navigation.", True, ("query",), True, {"query": {"type": "string", "minLength": 1}, "paths": {"type": "array", "items": {"type": "string"}}, "max_results": {"type": "integer", "minimum": 1}}), source.search_code)
+        self._register(ToolSpec("find_definition", "Semantic definition lookup when clangd is configured.", True, ("symbol",), True, {"symbol": {"type": "string"}}), source.unsupported_navigation)
+        self._register(ToolSpec("find_references", "Semantic reference lookup when clangd is configured.", True, ("symbol",), True, {"symbol": {"type": "string"}}), source.unsupported_navigation)
+        self._register(ToolSpec("edit_file", "Replace one uniquely matched old text after hash validation.", False, ("path", "expected_hash", "old_text", "new_text"), False, {"path": {"type": "string"}, "expected_hash": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}), edit.edit_file)
         self._register(ToolSpec("git_diff", "Read the actual Git working-tree diff.", True), source.git_diff)
-        self._register(ToolSpec("read_guideline", "Read a versioned Skill guideline.", True, ("skill_id",), True), self._read_guideline)
-        self._register(ToolSpec("memory_retrieve", "Retrieve provenance-bound historical episodes.", True, (), True), self._memory_retrieve)
+        self._register(ToolSpec("read_guideline", "Read a versioned Skill guideline.", True, ("skill_id",), True, {"skill_id": {"type": "string"}}), self._read_guideline)
+        self._register(ToolSpec("memory_retrieve", "Retrieve provenance-bound historical episodes.", True, (), False, {"repo": {"type": "string"}, "module": {"type": "string"}, "rule": {"type": "string"}, "keywords": {"type": "array", "items": {"type": "string"}}, "source_commit": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}), self._memory_retrieve)
 
     def _register(self, spec: ToolSpec, handler: Handler) -> None:
         self.registry.register(spec)
         self._handlers[spec.name] = handler
 
-    def execute(self, call: ToolCall | Any, *, expected_workspace_revision: int | None = None) -> Observation:
+    def execute(self, call: ToolCall | Any, *, expected_workspace_revision: int | None = None, deadline: float | None = None) -> Observation:
         start = time.monotonic()
-        call_id = str(getattr(call, "call_id", "unknown"))
+        call_id = str(getattr(call, "call_id", getattr(call, "action_id", "unknown")))
         name = str(getattr(call, "name", getattr(call, "tool", "")))
         arguments = getattr(call, "arguments", {})
         if not isinstance(arguments, dict):
@@ -96,17 +118,23 @@ class ToolExecutor:
         spec = self.registry.get(name)
         if spec is None:
             return self._observation(call_id, name, ToolStatus.ERROR, None, (), {}, False, start, f"unknown tool: {name}")
-        missing = [key for key in spec.required_args if key not in arguments]
-        if missing:
-            return self._observation(call_id, name, ToolStatus.ERROR, None, (), {}, False, start, f"missing arguments: {', '.join(missing)}")
+        invalid = spec.validation_error(arguments)
+        if invalid:
+            return self._observation(call_id, name, ToolStatus.ERROR, None, (), {}, False, start, invalid)
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            return self._observation(call_id, name, ToolStatus.ERROR, None, (), {}, False, start, "wall-clock budget exhausted before tool execution")
         try:
             lock = self._write_lock if not spec.read_only else _NullLock()
             with lock:
-                status, content, paths, hashes, complete, error = self._handlers[name](arguments)
+                handler_args = dict(arguments)
+                if deadline is not None:
+                    handler_args["_deadline"] = deadline
+                status, content, paths, hashes, complete, error = self._handlers[name](handler_args)
         except Exception as exc:  # tool failures become observations, never silent success
             status, content, paths, hashes, complete, error = ToolStatus.ERROR, None, (), {}, False, f"{type(exc).__name__}: {exc}"
-        if isinstance(content, str) and len(content) > self.limits.max_output_chars:
-            content = content[: self.limits.max_output_chars]
+        if content is not None and len(canonical_json(content)) > self.limits.max_output_chars:
+            content = {"preview": canonical_json(content)[: self.limits.max_output_chars], "truncated": True}
             status = ToolStatus.TRUNCATED
             complete = False
             error = error or "tool output limit reached"
@@ -119,8 +147,8 @@ class ToolExecutor:
         if self.skill_store is None:
             return ToolStatus.UNSUPPORTED, None, (), {}, False, "Skill store is not configured"
         try:
-            skill = self.skill_store.load(str(arguments["skill_id"]))
-        except (OSError, ValueError) as exc:
+            skill = self.skill_store.load(str(arguments["skill_id"]), max_bytes=self.limits.max_file_bytes, deadline=arguments.get("_deadline"))
+        except (OSError, TimeoutError, ValueError) as exc:
             return ToolStatus.ERROR, None, (), {}, False, str(exc)
         return ToolStatus.OK, {"skill_id": skill.skill_id, "version": skill.version, "source": skill.source, "content_hash": skill.content_hash, "content": skill.content}, (), {}, True, None
 
@@ -134,6 +162,7 @@ class ToolExecutor:
             keywords=tuple(str(item) for item in arguments.get("keywords", ())),
             source_commit=str(arguments.get("source_commit", "")),
             limit=min(10, int(arguments.get("limit", 5))),
+            deadline=float(arguments["_deadline"]) if arguments.get("_deadline") is not None else None,
         )
         if not episodes:
             return ToolStatus.EMPTY, [], (), {}, True, "no matching historical episode"

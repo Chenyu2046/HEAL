@@ -45,8 +45,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--task", required=True)
     run.add_argument("--model", choices=("scripted", "openai-compatible"), default=None)
     run.add_argument("--decisions", default=None, help="JSON decisions for ScriptedModel")
+    for name in ("max-model-calls", "max-tool-calls", "max-tokens", "max-wall-seconds", "max-edit-attempts", "max-chunk-actions"):
+        run.add_argument(f"--{name}", type=float if name == "max-wall-seconds" else int, default=None)
     resume = sub.add_parser("resume")
     resume.add_argument("--run-id", required=True)
+    reconcile = sub.add_parser("reconcile")
+    reconcile.add_argument("--candidate-id", required=True)
+    reconcile.add_argument("--submission-id", required=True)
+    retry_ci = sub.add_parser("retry-ci-dispatch")
+    retry_ci.add_argument("--candidate-id", required=True)
+    gc = sub.add_parser("gc")
+    gc.add_argument("--older-than-hours", type=float, default=168.0)
+    gc.add_argument("--apply", action="store_true", help="perform cleanup; default is dry-run")
+    gc.add_argument("--include-pending-review", action="store_true", help="allow expired HUMAN_REVIEW workspaces to be removed")
     report = sub.add_parser("report")
     report.add_argument("--run-id", required=True)
     approve = sub.add_parser("approve")
@@ -58,15 +69,17 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--candidate-id", required=True)
     submit.add_argument("--branch", required=True)
     submit.add_argument("--change-id", required=True)
-    submit.add_argument("--fixed-commit", required=True)
+    submit.add_argument("--candidate-commit", "--fixed-commit", dest="candidate_commit", required=True)
     ci = sub.add_parser("ci-result")
     ci.add_argument("--candidate-id", required=True)
     ci.add_argument("--ci-run-id", required=True)
+    ci.add_argument("--dispatch-id", required=True)
     ci.add_argument("--revision", required=True)
     ci.add_argument("--actual-tested-commit", default=None)
     ci.add_argument("--config-id", required=True)
     ci.add_argument("--backend", required=True)
     ci.add_argument("--checks", required=True, help="JSON object, e.g. '{\"build\":\"PASS\"}'")
+    ci.add_argument("--final", action="store_true", help="mark an incremental CI callback as final")
     local = sub.add_parser("local-validate")
     local.add_argument("--candidate-id", required=True)
     local.add_argument("--workspace", required=True)
@@ -85,32 +98,42 @@ def main(argv: list[str] | None = None) -> int:
             payload = _json_file(args.task)
             if not isinstance(payload, dict):
                 raise ValueError("task JSON must be an object")
-            result = _orchestrator(args).run(payload)
-            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2, default=str))
+            overrides = {key: getattr(args, key) for key in ("max_model_calls", "max_tool_calls", "max_tokens", "max_wall_seconds", "max_edit_attempts", "max_chunk_actions") if getattr(args, key) is not None}
+            result = _orchestrator(args).run(payload, cli_budget_overrides=overrides)
+            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2))
             return 0
         orchestrator = _orchestrator(args)
         if args.command == "resume":
-            print(json.dumps(orchestrator.resume(args.run_id), ensure_ascii=False, indent=2, default=str))
+            print(json.dumps(to_primitive(orchestrator.resume(args.run_id)), ensure_ascii=False, indent=2))
+        elif args.command == "reconcile":
+            result = orchestrator.reconcile_submission(args.candidate_id, submission_id=args.submission_id)
+            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2))
+        elif args.command == "retry-ci-dispatch":
+            result = orchestrator.retry_ci_dispatch(args.candidate_id)
+            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2))
+        elif args.command == "gc":
+            result = orchestrator.gc(older_than_hours=args.older_than_hours, apply=args.apply, include_pending_review=args.include_pending_review)
+            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2))
         elif args.command == "report":
             print(json.dumps({"paths": orchestrator.report(args.run_id)}, ensure_ascii=False, indent=2))
         elif args.command == "approve":
             approval = orchestrator.approve(args.candidate_id, reviewer=args.reviewer, reason=args.reason, approved=args.approved)
             print(json.dumps(to_primitive(approval), ensure_ascii=False, indent=2))
         elif args.command == "submit":
-            result = orchestrator.submit(args.candidate_id, branch=args.branch, change_id=args.change_id, fixed_commit=args.fixed_commit)
-            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2, default=str))
+            result = orchestrator.submit(args.candidate_id, branch=args.branch, change_id=args.change_id, candidate_commit=args.candidate_commit)
+            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2))
         elif args.command == "ci-result":
             checks = json.loads(args.checks)
             if not isinstance(checks, dict):
                 raise ValueError("--checks must be a JSON object")
-            result = orchestrator.receive_ci(args.candidate_id, ci_run_id=args.ci_run_id, revision=args.revision, actual_tested_commit=args.actual_tested_commit, config_id=args.config_id, backend=args.backend, checks=checks)
-            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2, default=str))
+            result = orchestrator.receive_ci(args.candidate_id, ci_run_id=args.ci_run_id, revision=args.revision, actual_tested_commit=args.actual_tested_commit, config_id=args.config_id, backend=args.backend, checks=checks, dispatch_id=args.dispatch_id, final=args.final)
+            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2))
         elif args.command == "local-validate":
             commands = json.loads(args.commands)
             if not isinstance(commands, dict) or any(not isinstance(argv, list) for argv in commands.values()):
                 raise ValueError("--commands must map check names to argv arrays")
             result = orchestrator.validate_local(args.candidate_id, commit=args.commit, config_id=args.config_id, workspace=args.workspace, commands=commands)
-            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2, default=str))
+            print(json.dumps(to_primitive(result), ensure_ascii=False, indent=2))
         return 0
     except (ConfigError, OrchestratorError, ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
