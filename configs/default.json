@@ -1,0 +1,26 @@
+{
+  "version": "1",
+  "mode": "local-demo",
+  "source_repo": null,
+  "workspace_parent": ".repair-agent/workspaces",
+  "artifact_root": ".repair-agent/runs",
+  "skill_root": "skills",
+  "memory_root": ".repair-agent/memory",
+  "max_workers": 2,
+  "chunking_enabled": false,
+  "budget": {
+    "max_model_calls": 20,
+    "max_tool_calls": 100,
+    "max_tokens": 100000,
+    "max_wall_seconds": 900,
+    "max_edit_attempts": 20
+  },
+  "model": {
+    "provider": "scripted",
+    "model_id": "scripted",
+    "endpoint": null,
+    "api_key_env": null,
+    "timeout_seconds": 60,
+    "max_retries": 1
+  }
+}
