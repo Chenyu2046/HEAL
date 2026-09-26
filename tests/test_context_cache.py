@@ -82,9 +82,9 @@ class ContextCacheTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.repo, self.base = make_repo(Path(temporary.name))
 
-    def executor(self, *, cache: ContextCache | None = None, limits: ToolLimits | None = None, workspace: WorkspaceState | None = None) -> tuple[ToolExecutor, WorkspaceState]:
+    def executor(self, *, cache: ContextCache | None = None, limits: ToolLimits | None = None, workspace: WorkspaceState | None = None, search_backend: str = "auto") -> tuple[ToolExecutor, WorkspaceState]:
         workspace = workspace or WorkspaceState(self.repo, self.base)
-        return ToolExecutor(workspace, limits=limits, cache=cache), workspace
+        return ToolExecutor(workspace, limits=limits, cache=cache, search_backend=search_backend), workspace
 
     def test_read_file_hit_does_not_reread_content(self) -> None:
         executor, _ = self.executor(cache=ContextCache())
@@ -129,7 +129,9 @@ class ContextCacheTests(unittest.TestCase):
         self.assertEqual((reread_b.content, reread_b.file_hashes), (read_b.content, read_b.file_hashes))
 
     def test_search_hit_and_invalidation(self) -> None:
-        executor, _ = self.executor(cache=ContextCache())
+        # Phase-1 evidence-read counting is defined against the Python scanner
+        # (rg 后端不经过 Path.read_text);形状断言适配 Phase 2 的按文件聚合输出。
+        executor, _ = self.executor(cache=ContextCache(), search_backend="python")
         with counted_evidence_reads() as counter:
             first = executor.execute(search_call("OLD"))
             scans_after_first = counter["read_text"]
@@ -152,14 +154,16 @@ class ContextCacheTests(unittest.TestCase):
             empty_rescan = executor.execute(search_call("ZZZ"))
             scans_after_rescan = counter["read_text"]
         self.assertEqual(first.status, ToolStatus.OK)
-        self.assertEqual(len(first.content), 2)
+        self.assertEqual(first.content["total_hits"], 2)
+        self.assertEqual([item["path"] for item in first.content["files"]], ["src/a.c"])
+        self.assertEqual(first.content["files"][0]["hits"], 2)
         self.assertEqual(scans_after_first, 3)
         self.assertEqual((second.status, second.content, second.file_hashes, second.complete), (first.status, first.content, first.file_hashes, first.complete))
         self.assertEqual(scans_after_hit, 3)
         self.assertEqual(scoped.status, ToolStatus.OK)
         self.assertEqual(scans_after_scope, 5)
         self.assertEqual(after_edit.status, ToolStatus.OK)
-        self.assertEqual(len(after_edit.content), 1)
+        self.assertEqual(after_edit.content["total_hits"], 1)
         self.assertEqual(scans_after_edit, 8)
         self.assertEqual((replayed.status, replayed.content, replayed.file_hashes), (after_edit.status, after_edit.content, after_edit.file_hashes))
         self.assertEqual(scans_after_replay, 8)
@@ -170,7 +174,7 @@ class ContextCacheTests(unittest.TestCase):
         self.assertEqual(scans_after_rescan, 14)
 
     def test_search_empty_then_edit_introducing_match_is_not_stale(self) -> None:
-        executor, _ = self.executor(cache=ContextCache())
+        executor, _ = self.executor(cache=ContextCache(), search_backend="python")
         with counted_evidence_reads() as counter:
             empty = executor.execute(search_call("GUARD_CHECK"))
             scans_before = counter["read_text"]
@@ -185,7 +189,10 @@ class ContextCacheTests(unittest.TestCase):
         self.assertEqual(empty.status, ToolStatus.EMPTY)
         self.assertEqual(found.status, ToolStatus.OK)
         self.assertEqual(found.complete, True)
-        self.assertEqual(found.content, [{"path": "src/a.c", "line": 2, "text": "// GUARD_CHECK added"}])
+        self.assertEqual(found.content, {
+            "files": [{"path": "src/a.c", "hits": 1, "sample_lines": [{"line": 2, "text": "// GUARD_CHECK added"}]}],
+            "total_hits": 1,
+        })
         self.assertGreater(scans_after, scans_before)
 
     def test_read_file_empty_range_replay_matches_direct(self) -> None:
@@ -203,7 +210,7 @@ class ContextCacheTests(unittest.TestCase):
 
     def test_search_invalidated_when_touched_file_is_deleted(self) -> None:
         (self.repo / "src" / "b.c").write_bytes(b"int other = OLD;\n")
-        executor, _ = self.executor(cache=ContextCache())
+        executor, _ = self.executor(cache=ContextCache(), search_backend="python")
         with counted_evidence_reads() as counter:
             first = executor.execute(search_call("OLD"))
             scans_after_first = counter["read_text"]
@@ -211,15 +218,15 @@ class ContextCacheTests(unittest.TestCase):
             after_delete = executor.execute(search_call("OLD"))
             scans_after_delete = counter["read_text"]
         self.assertEqual(first.status, ToolStatus.OK)
-        self.assertEqual({item["path"] for item in first.content}, {"src/a.c", "src/b.c"})
+        self.assertEqual({item["path"] for item in first.content["files"]}, {"src/a.c", "src/b.c"})
         self.assertEqual(scans_after_first, 3)
         self.assertEqual(after_delete.status, ToolStatus.OK)
-        self.assertEqual({item["path"] for item in after_delete.content}, {"src/a.c"})
+        self.assertEqual({item["path"] for item in after_delete.content["files"]}, {"src/a.c"})
         self.assertEqual(after_delete.complete, True)
         self.assertEqual(scans_after_delete, 5)
 
     def test_search_partial_is_never_cached(self) -> None:
-        executor, workspace = self.executor(cache=ContextCache())
+        executor, workspace = self.executor(cache=ContextCache(), search_backend="python")
         with counted_evidence_reads() as counter:
             limited_first = executor.execute(search_call("OLD", max_results=1))
             scans_after_first = counter["read_text"]
@@ -229,7 +236,7 @@ class ContextCacheTests(unittest.TestCase):
         self.assertEqual(limited_first.complete, False)
         self.assertEqual(limited_second.status, ToolStatus.PARTIAL)
         self.assertGreater(scans_after_second, scans_after_first)
-        source = source_module.SourceTools(workspace, max_file_bytes=256_000, max_output_chars=80_000, max_search_results=200, cache=ContextCache())
+        source = source_module.SourceTools(workspace, max_file_bytes=256_000, max_output_chars=80_000, max_search_results=200, cache=ContextCache(), search_backend="python")
         deadline_partial = source.search_code({"query": "OLD", "_deadline": 0.0})
         self.assertEqual(deadline_partial[0], ToolStatus.PARTIAL)
         self.assertEqual(len(source.cache.searches), 0)

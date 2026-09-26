@@ -74,6 +74,9 @@ def _budget(value: Mapping[str, Any] | None) -> Budget:
         max_wall_seconds=float(value.get("max_wall_seconds", 900.0)),
         max_edit_attempts=int(value.get("max_edit_attempts", 20)),
         max_chunk_actions=int(value.get("max_chunk_actions", 8)),
+        max_context_files=int(value.get("max_context_files", 24)),
+        max_symbol_expansions=int(value.get("max_symbol_expansions", 12)),
+        max_search_rounds=int(value.get("max_search_rounds", 8)),
     )
 
 

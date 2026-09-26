@@ -111,9 +111,52 @@ class SearchResultCache:
         return len(self._entries)
 
 
+@dataclass(frozen=True)
+class SymbolContextEntry:
+    # symbols 元素是 tools.symbols.SymbolDecl(frozen dataclass);这里只按 tuple
+    # 存取、不做运行时导入,避免 context -> tools/__init__(executor) -> context 导入环。
+    symbols: tuple["SymbolDecl", ...]
+    content_hash: str
+    observed_hash: str
+
+
+class SymbolCache:
+    """符号结构缓存(方案 §4.3 第三区),键为 path;命中 = 记录的文件 hash 与当前 observed hash 一致。
+
+    与 FileContextCache 同一机制:纯内存比较,edit_file 成功即 mark_edit 更新
+    observed_hashes,按路径校验自然失效、无关文件继续复用。命中时调用方零内容
+    读取(不 stat/hash 文件内容、不重新扫描)。超过 max_file_bytes 的文件在
+    SourceTools 读到内容之前就已返回,结构上进不了缓存;空符号列表同样入缓存
+    (空文件的结构是稳定事实,与 read_file 空区间入缓存口径一致)。
+    """
+
+    def __init__(self, *, capacity: int = DEFAULT_CAPACITY) -> None:
+        if capacity < 1:
+            raise ValueError("context cache capacity must be positive")
+        self._capacity = capacity
+        self._entries: OrderedDict[str, SymbolContextEntry] = OrderedDict()
+
+    def get(self, path: str, observed_hash: str | None) -> SymbolContextEntry | None:
+        entry = self._entries.get(path)
+        if entry is None or observed_hash is None or observed_hash != entry.observed_hash:
+            return None
+        self._entries.move_to_end(path)
+        return entry
+
+    def put(self, path: str, *, symbols: tuple["SymbolDecl", ...], content_hash: str, observed_hash: str) -> None:
+        self._entries[path] = SymbolContextEntry(symbols, content_hash, observed_hash)
+        self._entries.move_to_end(path)
+        while len(self._entries) > self._capacity:
+            self._entries.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
 class ContextCache:
-    """门面:聚合 FileContextCache 与 SearchResultCache,两个区各自独立 LRU 容量。"""
+    """门面:聚合 File/Search/Symbol 三个缓存区,各区独立 LRU 容量。"""
 
     def __init__(self, *, capacity: int = DEFAULT_CAPACITY) -> None:
         self.files = FileContextCache(capacity=capacity)
         self.searches = SearchResultCache(capacity=capacity)
+        self.symbols = SymbolCache(capacity=capacity)

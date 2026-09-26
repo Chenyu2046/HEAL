@@ -16,7 +16,7 @@ from ..models import ToolCall
 from ..runtime.workspace import WorkspaceState
 from ..skills import SkillStore
 from .edit import EditTool
-from .source import SourceTools
+from .source import SearchRankingContext, SourceTools
 
 
 Handler = Callable[[dict[str, Any]], tuple[ToolStatus, Any, tuple[str, ...], dict[str, str], bool, str | None]]
@@ -84,6 +84,8 @@ class ToolExecutor:
         skill_store: SkillStore | None = None,
         episode_store: EpisodeStore | None = None,
         cache: ContextCache | None = None,
+        ranking_context: "SearchRankingContext | None" = None,
+        search_backend: str = "auto",
     ) -> None:
         self.workspace = workspace
         self.limits = limits or ToolLimits()
@@ -93,10 +95,11 @@ class ToolExecutor:
         self.registry = ToolRegistry()
         self._write_lock = threading.Lock()
         self._handlers: dict[str, Handler] = {}
-        source = SourceTools(workspace, max_file_bytes=self.limits.max_file_bytes, max_output_chars=self.limits.max_output_chars, max_search_results=self.limits.max_search_results, cache=cache)
+        source = SourceTools(workspace, max_file_bytes=self.limits.max_file_bytes, max_output_chars=self.limits.max_output_chars, max_search_results=self.limits.max_search_results, cache=cache, ranking=ranking_context, search_backend=search_backend)
         edit = EditTool(workspace, max_file_bytes=self.limits.max_file_bytes)
         self._register(ToolSpec("read_file", "Read a bounded UTF-8 source range.", True, ("path",), True, {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}, "max_chars": {"type": "integer", "minimum": 1}}), source.read_file)
         self._register(ToolSpec("search_code", "Text search only; not complete C++ semantic navigation.", True, ("query",), True, {"query": {"type": "string", "minLength": 1}, "paths": {"type": "array", "items": {"type": "string"}}, "max_results": {"type": "integer", "minimum": 1}}), source.search_code)
+        self._register(ToolSpec("list_symbols", "Heuristic lexical C/C++ symbol outline of one file (namespaces/classes/member functions with line ranges); comments, macros, and templates are unreliable, and this is not semantic navigation.", True, ("path",), True, {"path": {"type": "string"}}), source.list_symbols)
         self._register(ToolSpec("find_definition", "Semantic definition lookup when clangd is configured.", True, ("symbol",), True, {"symbol": {"type": "string"}}), source.unsupported_navigation)
         self._register(ToolSpec("find_references", "Semantic reference lookup when clangd is configured.", True, ("symbol",), True, {"symbol": {"type": "string"}}), source.unsupported_navigation)
         self._register(ToolSpec("edit_file", "Replace one uniquely matched old text after hash validation.", False, ("path", "expected_hash", "old_text", "new_text"), False, {"path": {"type": "string"}, "expected_hash": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}), edit.edit_file)

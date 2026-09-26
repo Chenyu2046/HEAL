@@ -252,9 +252,13 @@ class Budget:
     max_wall_seconds: float = 900.0
     max_edit_attempts: int = 20
     max_chunk_actions: int = 8
+    # 方案 §9 的 Context Expansion 边界:探索不允许无限 search → read 循环。
+    max_context_files: int = 24
+    max_symbol_expansions: int = 12
+    max_search_rounds: int = 8
 
     def __post_init__(self) -> None:
-        if min(self.max_model_calls, self.max_tool_calls, self.max_tokens, self.max_edit_attempts) < 0 or self.max_wall_seconds <= 0:
+        if min(self.max_model_calls, self.max_tool_calls, self.max_tokens, self.max_edit_attempts, self.max_context_files, self.max_symbol_expansions, self.max_search_rounds) < 0 or self.max_wall_seconds <= 0:
             raise ValueError("execution budgets must be non-negative and wall time must be positive")
         if not 1 <= self.max_chunk_actions <= 8:
             raise ValueError("max_chunk_actions must be between 1 and 8")

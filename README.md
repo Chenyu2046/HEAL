@@ -32,6 +32,7 @@ repair-agent local-validate --candidate-id CANDIDATE_ID --workspace PATH --commi
 
 ## Deliberate boundaries
 
+- `search_code` prefers a ripgrep backend (`--json`, fixed argv, `.gitignore`-aware like the tree hash, protected-path globs excluded) and falls back to the bundled Python scanner when `rg` is absent; results are identifier-aware heuristically ranked and aggregated per file. `list_symbols` returns a lexical C/C++ outline (comments and macros are unreliable) from the standard library — both are navigation evidence, not clangd/C++ semantic navigation.
 - `edit_file` supports only existing regular files, with current-content hash and unique old-text validation. Creation/deletion is explicit `UNSUPPORTED`.
 - Chunking is implemented but disabled by default. It accepts only known, independent, read-only actions and stops on empty, ambiguous, partial, truncated, version-changed, unsupported, or error results. It never freezes a candidate.
 - Workers have isolated task/batch memory. Only explicitly stored, provenance-bound episodes can be shared.

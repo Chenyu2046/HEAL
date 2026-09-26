@@ -35,6 +35,16 @@ from .validation.scope import PatchScopeGuard
 TraceCallback = Callable[[Observation], None]
 UsageCallback = Callable[["AgentUsage"], None]
 
+# Chunk execution blocks on budget reasons before any action runs; those specific
+# reasons are surfaced, while every other chunk failure keeps the durable generic reason.
+_CHUNK_BUDGET_REASONS = frozenset({
+    "tool call budget exhausted during action chunk",
+    "wall-clock budget exhausted during action chunk",
+    "search round budget exhausted",
+    "symbol expansion budget exhausted",
+    "context file budget exhausted",
+})
+
 
 def _safe_review_reason(reason: str) -> str:
     """Keep durable review reasons useful without copying arbitrary response/error text."""
@@ -44,6 +54,7 @@ def _safe_review_reason(reason: str) -> str:
         "edit attempt budget exhausted", "wall-clock budget exhausted",
         "tool call budget exhausted during action chunk", "wall-clock budget exhausted during action chunk",
         "model request attempt budget exhausted",
+        "search round budget exhausted", "symbol expansion budget exhausted", "context file budget exhausted",
         "skill context limit exceeded",
         "skill context deadline exceeded",
     }
@@ -90,6 +101,9 @@ class AgentUsage:
     chunk_actions: int = 0
     changed_files: int = 0
     diff_lines: int = 0
+    search_rounds: int = 0
+    symbol_expansions: int = 0
+    context_files: int = 0
     elapsed_seconds: float = 0.0
     started_at: float = 0.0
     retry_events: list[dict[str, Any]] = field(default_factory=list)
@@ -102,6 +116,9 @@ class AgentUsage:
             and self.token_usage_known
             and self.tokens < budget.max_tokens
             and self.edit_attempts < budget.max_edit_attempts
+            and self.search_rounds < budget.max_search_rounds
+            and self.symbol_expansions < budget.max_symbol_expansions
+            and self.context_files < budget.max_context_files
             and time.monotonic() - self.started_at < budget.max_wall_seconds
         )
 
@@ -237,9 +254,13 @@ class AgentLoop:
                 usage.tool_calls += 1
                 if decision.tool_call.name == "edit_file":
                     usage.edit_attempts += 1
+                if decision.tool_call.name == "search_code":
+                    usage.search_rounds += 1
+                if decision.tool_call.name == "list_symbols":
+                    usage.symbol_expansions += 1
                 self._persist_usage(usage)
                 observation = self.executor.execute(decision.tool_call, expected_workspace_revision=self.executor.workspace.revision, deadline=usage.started_at + self.task.budget.max_wall_seconds)
-                self._record(observation, observations, memory)
+                self._record(observation, observations, memory, usage)
                 state["workspace_revision"] = self.executor.workspace.revision
                 continue
 
@@ -256,16 +277,17 @@ class AgentLoop:
                     chunk, self.executor,
                     expected_workspace_revision=self.executor.workspace.revision,
                     max_actions=action_limit,
-                    before_action=lambda _action: self._chunk_budget_error(usage),
+                    before_action=lambda action: self._chunk_budget_error(usage, action),
                     deadline=usage.started_at + self.task.budget.max_wall_seconds,
                 )
                 usage.chunk_actions += len(result.completed)
                 self._persist_usage(usage)
                 for observation in (*result.completed, *result.not_executed):
-                    self._record(observation, observations, memory)
+                    self._record(observation, observations, memory, usage)
                 state["workspace_revision"] = self.executor.workspace.revision
                 if not result.accepted:
-                    return self._review(batch_id, usage, observations, "action chunk incomplete")
+                    reason = result.reason if result.reason in _CHUNK_BUDGET_REASONS else "action chunk incomplete"
+                    return self._review(batch_id, usage, observations, reason)
                 continue
 
             if decision.kind == "batch_ready":
@@ -296,13 +318,23 @@ class AgentLoop:
             reasons.append("model token usage unavailable; stopped to preserve budget")
         if usage.edit_attempts >= self.task.budget.max_edit_attempts:
             reasons.append("edit attempt budget exhausted")
+        if usage.search_rounds >= self.task.budget.max_search_rounds:
+            reasons.append("search round budget exhausted")
+        if usage.symbol_expansions >= self.task.budget.max_symbol_expansions:
+            reasons.append("symbol expansion budget exhausted")
+        if usage.context_files >= self.task.budget.max_context_files:
+            reasons.append("context file budget exhausted")
         if time.monotonic() - usage.started_at >= self.task.budget.max_wall_seconds:
             reasons.append("wall-clock budget exhausted")
         return self._review(batch_id, usage, observations, "; ".join(reasons) or "budget exhausted")
 
-    def _record(self, observation: Observation, observations: list[Observation], memory: TaskStateMemory) -> None:
+    def _record(self, observation: Observation, observations: list[Observation], memory: TaskStateMemory, usage: AgentUsage) -> None:
         observations.append(observation)
         memory.add(observation)
+        # context_files 的精确口径:observations 里去重的证据文件数(source_paths
+        # 覆盖 read/search/list_symbols/git_diff 触碰过的文件)。执行前 enforcement
+        # 用的近似口径见 _tool_budget_error 注释。
+        usage.context_files = len({path for item in observations for path in item.source_paths})
         if not observation.complete or observation.status in {
             ToolStatus.ERROR, ToolStatus.PARTIAL, ToolStatus.TRUNCATED, ToolStatus.VERSION_CHANGED,
             ToolStatus.AMBIGUOUS, ToolStatus.UNSUPPORTED, ToolStatus.NOT_EXECUTED,
@@ -333,16 +365,37 @@ class AgentLoop:
             return "tool call budget exhausted"
         if name == "edit_file" and usage.edit_attempts >= self.task.budget.max_edit_attempts:
             return "edit attempt budget exhausted"
+        if name == "search_code" and usage.search_rounds >= self.task.budget.max_search_rounds:
+            return "search round budget exhausted"
+        if name == "list_symbols" and usage.symbol_expansions >= self.task.budget.max_symbol_expansions:
+            return "symbol expansion budget exhausted"
+        if name in {"search_code", "list_symbols"} and len(self.executor.workspace.observed_hashes) >= self.task.budget.max_context_files:
+            # 近似口径:context_files 的精确计数是 observations 去重证据文件数
+            # (事后统计),执行前只能用已观察文件数(observed_hashes,含 warning
+            # 初始文件)近似;宁可在边界上早停,不做放行假设。
+            return "context file budget exhausted"
         if time.monotonic() - usage.started_at >= self.task.budget.max_wall_seconds:
             return "wall-clock budget exhausted"
         return None
 
-    def _chunk_budget_error(self, usage: AgentUsage) -> str | None:
+    def _chunk_budget_error(self, usage: AgentUsage, action: Any = None) -> str | None:
         if usage.tool_calls >= self.task.budget.max_tool_calls:
             return "tool call budget exhausted during action chunk"
+        name = str(getattr(action, "tool", ""))
+        if name == "search_code" and usage.search_rounds >= self.task.budget.max_search_rounds:
+            return "search round budget exhausted"
+        if name == "list_symbols" and usage.symbol_expansions >= self.task.budget.max_symbol_expansions:
+            return "symbol expansion budget exhausted"
+        if name in {"search_code", "list_symbols"} and len(self.executor.workspace.observed_hashes) >= self.task.budget.max_context_files:
+            # 同 _tool_budget_error 的近似口径:用已观察文件数判断 context_files。
+            return "context file budget exhausted"
         if time.monotonic() - usage.started_at >= self.task.budget.max_wall_seconds:
             return "wall-clock budget exhausted during action chunk"
         usage.tool_calls += 1
+        if name == "search_code":
+            usage.search_rounds += 1
+        if name == "list_symbols":
+            usage.symbol_expansions += 1
         self._persist_usage(usage)
         return None
 
@@ -413,7 +466,7 @@ class AgentLoop:
         usage.tool_calls += 1
         self._persist_usage(usage)
         diff_observation = self.executor.execute(diff_call, expected_workspace_revision=self.executor.workspace.revision, deadline=usage.started_at + self.task.budget.max_wall_seconds)
-        self._record(diff_observation, observations, TaskStateMemory(self.task.task_id, self.worker_id))
+        self._record(diff_observation, observations, TaskStateMemory(self.task.task_id, self.worker_id), usage)
         # The proposal must never use a model-written diff. Only the Git tool output is authoritative.
         if diff_observation.status not in {ToolStatus.OK, ToolStatus.EMPTY}:
             return None

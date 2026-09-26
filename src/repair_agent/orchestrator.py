@@ -46,6 +46,7 @@ from .runtime.trace import sanitize
 from .runtime.workspace import GitWorktreeManager, WorkspaceError, WorkspaceState, cleanup_stale_temp_files
 from .skills import SkillRouter, SkillStore
 from .tools.executor import ToolExecutor
+from .tools.source import SearchRankingContext
 from .validation.candidate import CandidateError, CandidateFreezer
 from .validation.local import CommandSpec, LocalValidator
 from .validation.results import IndependentValidator
@@ -320,7 +321,9 @@ class RepairOrchestrator:
             isolated_worker_id = f"{worker_id}-{batch.batch_id}-{uuid.uuid4().hex[:8]}"
             episode_store = EpisodeStore(self.config.memory_root, worker_id=isolated_worker_id, task_id=task.task_id)
             cache = ContextCache() if self.config.context_cache_enabled else None
-            executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store, cache=cache)
+            # 排序上下文 = 当前 batch issues 的 symbol/module/analysis_trace 词元
+            # (方案 §7);缺省(空上下文)时 search_code 不加分。
+            executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store, cache=cache, ranking_context=SearchRankingContext.from_issues(batch.issues))
             router = SkillRouter(skill_store)
             model = self.model_factory(task, isolated_worker_id)
             loop = AgentLoop(task, worker_id=isolated_worker_id, model=model, executor=executor, skill_router=router, chunking_enabled=self.config.chunking_enabled, retry_policy=RetryPolicy(self.config.model.max_retries), tool_limits=self.config.tools, max_recent_observations=self.config.max_recent_observations, max_observation_chars=self.config.max_observation_chars, max_skill_context_chars=self.config.max_skill_context_chars, max_skill_scan_bytes=self.config.max_skill_scan_bytes, trace_callback=lambda observation: self.store.record_trace(task.run_id, {"worker_id": isolated_worker_id, "batch_id": batch.batch_id, "observation": _observation_trace(observation)}), usage_callback=lambda usage: self.store.update_worker_budget(task.run_id, isolated_worker_id, to_primitive(usage)), budget_started_at=budget_started_at)
@@ -343,6 +346,9 @@ class RepairOrchestrator:
             "max_tool_calls": max(0, total.max_tool_calls - int(used.get("tool_calls", 0))),
             "max_tokens": max(0, total.max_tokens - int(used.get("tokens", 0))) if bool(used.get("token_usage_known", True)) else 0,
             "max_edit_attempts": max(0, total.max_edit_attempts - int(used.get("edit_attempts", 0))),
+            "max_context_files": max(0, total.max_context_files - int(used.get("context_files", 0))),
+            "max_symbol_expansions": max(0, total.max_symbol_expansions - int(used.get("symbol_expansions", 0))),
+            "max_search_rounds": max(0, total.max_search_rounds - int(used.get("search_rounds", 0))),
         }
         allocated: dict[str, Budget] = {}
         for index, batch in enumerate(slot):
@@ -668,6 +674,9 @@ class RepairOrchestrator:
             "token_usage_known": bool(used.get("token_usage_known", True)),
             "max_edit_attempts": max(0, int(budget.get("max_edit_attempts", self.config.budget.max_edit_attempts)) - int(used.get("edit_attempts", 0))),
             "max_wall_seconds": max(0.0, float(budget.get("max_wall_seconds", self.config.budget.max_wall_seconds)) - float(used.get("wall_seconds", 0.0))),
+            "max_context_files": max(0, int(budget.get("max_context_files", self.config.budget.max_context_files)) - int(used.get("context_files", 0))),
+            "max_symbol_expansions": max(0, int(budget.get("max_symbol_expansions", self.config.budget.max_symbol_expansions)) - int(used.get("symbol_expansions", 0))),
+            "max_search_rounds": max(0, int(budget.get("max_search_rounds", self.config.budget.max_search_rounds)) - int(used.get("search_rounds", 0))),
         }
         return {"run": run, "recovery_issues": issues, "action": action, "budget_remaining": remaining, "submission_intents": [to_primitive(item) for candidate in candidates for item in self.store.list_submissions(candidate.candidate_id)]}
 
