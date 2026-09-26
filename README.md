@@ -40,6 +40,10 @@ repair-agent local-validate --candidate-id CANDIDATE_ID --workspace PATH --commi
 - Enterprise Gerrit and CI adapters return explicit `NOT_CONFIGURED` boundaries without guessing private contracts.
 - The worktree is an edit isolation mechanism, not a security sandbox for untrusted code.
 
+## Benchmark
+
+`py -3.13 scripts/benchmark.py context|recall` runs a fixture-based harness over deterministic synthetic C/C++ repositories (no dataset files; fixtures are generated at runtime into temporary directories). `context` drives the same scripted repair with the ContextCache on and off and reports model calls, per-tool call counts, physical evidence reads, repeated physical reads (方案 §18 "Duplicate Physical File Reads / Task", separate from cache-hit logical calls), and wall time. `recall` reports File Recall@3/@5 over aggregated search results and Symbol Recall@5 over `list_symbols` candidates on planted symbols. Both are deterministic. This harness is **notCovered** for the real 800-warning dataset experiments and the three-arm A/B comparison of 方案 §19 — those require the warning dataset.
+
 ## Current verification boundary
 
-This delivery intentionally does not run tests, builds, the application, model calls, benchmarks, Docker setup, real Gerrit, enterprise CI, or CodeSonar. See [docs/implementation-status.md](docs/implementation-status.md) and [docs/reproduction.md](docs/reproduction.md) for the deferred checks.
+This delivery intentionally does not run tests, builds, the application, model calls, benchmarks on real data, Docker setup, real Gerrit, enterprise CI, or CodeSonar. See [docs/implementation-status.md](docs/implementation-status.md) and [docs/reproduction.md](docs/reproduction.md) for the deferred checks.

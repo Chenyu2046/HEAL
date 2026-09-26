@@ -40,11 +40,16 @@ class FileContextCache:
             raise ValueError("context cache capacity must be positive")
         self._capacity = capacity
         self._entries: OrderedDict[str, FileContextEntry] = OrderedDict()
+        # 纯内存计数(Phase 4 benchmark 口径),不影响任何缓存行为。
+        self.hits = 0
+        self.misses = 0
 
     def get(self, path: str, observed_hash: str | None) -> FileContextEntry | None:
         entry = self._entries.get(path)
         if entry is None or observed_hash is None or observed_hash != entry.observed_hash:
+            self.misses += 1
             return None
+        self.hits += 1
         self._entries.move_to_end(path)
         return entry
 
@@ -89,15 +94,21 @@ class SearchResultCache:
             raise ValueError("context cache capacity must be positive")
         self._capacity = capacity
         self._entries: OrderedDict[tuple[str, tuple[str, ...], int], SearchContextEntry] = OrderedDict()
+        # 纯内存计数(Phase 4 benchmark 口径),不影响任何缓存行为。
+        self.hits = 0
+        self.misses = 0
 
     def get(self, query: str, scope: tuple[str, ...], max_results: int, observed_hashes: Mapping[str, str]) -> SearchContextEntry | None:
         key = (query, scope, max_results)
         entry = self._entries.get(key)
         if entry is None:
+            self.misses += 1
             return None
         for path, digest in entry.file_hashes.items():
             if observed_hashes.get(path) != digest:
+                self.misses += 1
                 return None
+        self.hits += 1
         self._entries.move_to_end(key)
         return entry
 
@@ -135,11 +146,16 @@ class SymbolCache:
             raise ValueError("context cache capacity must be positive")
         self._capacity = capacity
         self._entries: OrderedDict[str, SymbolContextEntry] = OrderedDict()
+        # 纯内存计数(Phase 4 benchmark 口径),不影响任何缓存行为。
+        self.hits = 0
+        self.misses = 0
 
     def get(self, path: str, observed_hash: str | None) -> SymbolContextEntry | None:
         entry = self._entries.get(path)
         if entry is None or observed_hash is None or observed_hash != entry.observed_hash:
+            self.misses += 1
             return None
+        self.hits += 1
         self._entries.move_to_end(path)
         return entry
 
@@ -160,3 +176,17 @@ class ContextCache:
         self.files = FileContextCache(capacity=capacity)
         self.searches = SearchResultCache(capacity=capacity)
         self.symbols = SymbolCache(capacity=capacity)
+
+    def stats(self) -> dict[str, int]:
+        """缓存命中/未命中计数(Phase 4 benchmark 口径),纯内存、只读、不改行为。
+
+        计数按 get() 调用累计;缓存实例按 worker 注入且单线程顺序使用,无需加锁。
+        """
+        return {
+            "file_hits": self.files.hits,
+            "file_misses": self.files.misses,
+            "search_hits": self.searches.hits,
+            "search_misses": self.searches.misses,
+            "symbol_hits": self.symbols.hits,
+            "symbol_misses": self.symbols.misses,
+        }
