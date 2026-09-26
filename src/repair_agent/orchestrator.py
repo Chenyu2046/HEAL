@@ -141,17 +141,29 @@ class RepairOrchestrator:
     def _run_normalized(self, normalized) -> WorkflowResult:
         task = normalized.task
         workflow_started_at = time.monotonic()
-        record = RunRecord(task.run_id, task.task_id, Stage.RECEIVED, self.config.version, task.model_id, {})
-        self.store.create_run(record, {"task": to_primitive(task), "normalization_warnings": list(normalized.warnings), "config": to_primitive(self.config), "budget_used": {}, "worker_budget_usage": {}})
-        self.store.transition(task.run_id, Stage.REPAIRING)
-        source_repo = Path(self.config.source_repo or task.repo).resolve()
         manager = GitWorktreeManager(self.config.workspace_parent)
         try:
-            resolved_base = self._assert_git_source(source_repo, task.base_commit)
+            source_repo, resolved_base = self._assert_git_source(Path(self.config.source_repo or task.repo), task.base_commit)
         except WorkspaceError as exc:
+            record = RunRecord(task.run_id, task.task_id, Stage.RECEIVED, self.config.version, task.model_id, {})
+            self.store.create_run(record, {"task": to_primitive(task), "normalization_warnings": list(normalized.warnings), "config": to_primitive(self.config), "budget_used": {}, "worker_budget_usage": {}})
+            self.store.transition(task.run_id, Stage.REPAIRING)
             return self._finish_review(task.run_id, (f"NOT_CONFIGURED/WORKSPACE: {exc}",))
         task = replace(task, base_commit=resolved_base, issues=tuple(replace(issue, base_commit=resolved_base) for issue in task.issues))
-        self.store.transition(task.run_id, Stage.REPAIRING, payload_update={"task": to_primitive(task), "resolved_base_commit": resolved_base})
+        record = RunRecord(task.run_id, task.task_id, Stage.RECEIVED, self.config.version, task.model_id, {})
+        self.store.create_run(record, {
+            "task": to_primitive(task),
+            "normalization_warnings": list(normalized.warnings),
+            "config": to_primitive(self.config),
+            "budget_used": {},
+            "worker_budget_usage": {},
+            "resolved_source_repo": str(source_repo),
+            "resolved_base_commit": resolved_base,
+        })
+        resolved_run = self.store.get_run(task.run_id) or {}
+        source_repo = Path(str(resolved_run["resolved_source_repo"]))
+        task = replace(task, base_commit=str(resolved_run["resolved_base_commit"]))
+        self.store.transition(task.run_id, Stage.REPAIRING)
 
         batches = self.batch_planner.plan(task)
         worker_pool = WorkerPool(self.config.max_workers)
@@ -259,12 +271,10 @@ class RepairOrchestrator:
         report_paths = self._write_report(task.run_id)
         return WorkflowResult(task.run_id, Stage.HUMAN_REVIEW, frozen.candidate, proposals, integration_result.semantic_warnings, report_paths)
 
-    def _assert_git_source(self, source_repo: Path, base_commit: str) -> str:
+    def _assert_git_source(self, source_repo: Path, base_commit: str) -> tuple[Path, str]:
         manager = GitWorktreeManager(self.config.workspace_parent)
-        # A non-mutating validation keeps the actual worktree creation in the worker path.
-        if not source_repo.is_dir():
-            raise WorkspaceError(f"source repository is not configured: {source_repo}")
-        return manager.resolve_commit(source_repo, base_commit)
+        canonical_repo = manager.resolve_source_repo(source_repo)
+        return canonical_repo, manager.resolve_commit(canonical_repo, base_commit)
 
     def _build_integration_replan(
         self,
@@ -581,8 +591,14 @@ class RepairOrchestrator:
             candidate = next((item for item in candidates if item.candidate_id == run.get("candidate_id")), candidates[-1])
             self._restore_candidate_workspace(candidate, run)
             run = self.store.get_run(run_id) or run
-        recoverable_validation_stage = run["stage"] in {Stage.CI_PENDING.value, Stage.RETRY_INFRA.value, Stage.VERIFIED.value} or (
-            run["stage"] == Stage.REVIEW_REQUIRED.value and run.get("failure_class") == "INCONCLUSIVE"
+        recoverable_validation_stage = run["stage"] == Stage.CI_PENDING.value or (
+            run.get("validation_backend") != "local"
+            and (
+                run["stage"] in {Stage.RETRY_INFRA.value, Stage.VERIFIED.value}
+                or (
+                    run["stage"] == Stage.REVIEW_REQUIRED.value and run.get("failure_class") == "INCONCLUSIVE"
+                )
+            )
         )
         if not issues and recoverable_validation_stage:
             expected_ci_run = run.get("ci_run_id")
@@ -721,22 +737,14 @@ class RepairOrchestrator:
         self._assert_candidate_current(candidate)
         specs = {name: CommandSpec(tuple(argv), self.config.tools.command_timeout_seconds) for name, argv in commands.items()}
         result = self.local_validator.run(candidate=candidate, workspace=Path(workspace), commit=commit, config_id=config_id, commands=specs)
-        result = self.store.save_validation(result)
-        if result.duplicate:
-            return result
-        current_stage = (self.store.get_run(candidate.run_id) or {}).get("stage")
-        if result.classification == ValidationClass.VALIDATION_PASS:
-            if current_stage in {Stage.CANDIDATE_FROZEN.value, Stage.HUMAN_REVIEW.value}:
-                self.store.transition(candidate.run_id, Stage.HUMAN_REVIEW, payload_update={"validation_id": result.validation_id, "validation_backend": "local"})
-            else:
-                self.store.transition(candidate.run_id, Stage.VERIFIED, payload_update={"validation_id": result.validation_id, "validation_backend": "local"})
-                self._cleanup_run_worktrees(candidate.run_id)
-        elif result.classification == ValidationClass.CODE_FAIL:
-            self.store.transition(candidate.run_id, Stage.REPAIRING, payload_update={"validation_id": result.validation_id, "new_attempt_id": f"attempt-{uuid.uuid4().hex}"}, failure_class="CODE_FAIL")
-        elif result.classification == ValidationClass.INFRA_FAIL:
-            self.store.transition(candidate.run_id, Stage.RETRY_INFRA, payload_update={"validation_id": result.validation_id}, failure_class="INFRA_FAIL")
-        else:
-            self.store.transition(candidate.run_id, Stage.REVIEW_REQUIRED, payload_update={"validation_id": result.validation_id}, failure_class="INCONCLUSIVE")
+        validation_payload = {}
+        if result.classification == ValidationClass.CODE_FAIL:
+            validation_payload["new_attempt_id"] = f"attempt-{uuid.uuid4().hex}"
+        result, _ = self.store.save_local_validation_and_transition(
+            result,
+            run_id=candidate.run_id,
+            payload_update=validation_payload,
+        )
         return result
 
     def _assert_candidate_current(self, candidate: Candidate) -> None:
@@ -751,8 +759,20 @@ class RepairOrchestrator:
             raise OrchestratorError(f"candidate invalidated by workspace change: {exc}") from exc
 
     def _restore_candidate_workspace(self, candidate: Candidate, run: Mapping[str, Any]) -> None:
+        manager = GitWorktreeManager(self.config.workspace_parent)
+        try:
+            repo = self._resolved_run_source_repo(candidate, run, manager)
+        except (OrchestratorError, WorkspaceError) as exc:
+            if Stage(run["stage"]) != Stage.REVIEW_REQUIRED:
+                self.store.transition(candidate.run_id, Stage.REVIEW_REQUIRED, payload_update={"source_identity_error": str(exc)}, failure_class="SOURCE_IDENTITY_MISMATCH")
+            raise OrchestratorError(f"candidate source repository identity could not be restored: {exc}") from exc
         configured_path = run.get("integration_workspace")
         if configured_path and Path(configured_path).is_dir():
+            registered = next((entry for entry in manager.entries() if entry.get("run_id") == candidate.run_id and Path(entry.get("path", "")).resolve() == Path(configured_path).resolve()), None)
+            if registered is None or manager.resolve_source_repo(registered["source_repo"]) != repo:
+                if Stage(run["stage"]) != Stage.REVIEW_REQUIRED:
+                    self.store.transition(candidate.run_id, Stage.REVIEW_REQUIRED, payload_update={"source_identity_error": "integration workspace is not registered to the resolved source repository"}, failure_class="SOURCE_IDENTITY_MISMATCH")
+                raise OrchestratorError("integration workspace is not registered to the resolved source repository")
             try:
                 self.freezer.assert_current(candidate, Path(configured_path))
                 self.freezer.assert_commit_identity(candidate, Path(configured_path))
@@ -761,9 +781,6 @@ class RepairOrchestrator:
                     self.store.transition(candidate.run_id, Stage.REVIEW_REQUIRED, payload_update={"identity_error": str(exc)}, failure_class="IDENTITY_MISMATCH")
                 raise OrchestratorError(f"candidate workspace failed recovery identity checks: {exc}") from exc
             return
-        task_payload = run.get("task", {})
-        repo = Path(str(task_payload.get("repo") or self.config.source_repo or "")).resolve()
-        manager = GitWorktreeManager(self.config.workspace_parent)
         handle = manager.create(task_id=f"{candidate.run_id}-integration", source_repo=repo, base_commit=candidate.candidate_commit, run_id=candidate.run_id, role="integration")
         try:
             self.freezer.assert_current(candidate, handle.path)
@@ -774,6 +791,28 @@ class RepairOrchestrator:
         manager.mark(handle, "RECOVERABLE")
         self.store.transition(candidate.run_id, Stage(run["stage"]), payload_update={"integration_workspace": str(handle.path), "restored_from_candidate_commit": True})
         self.store.record_trace(candidate.run_id, {"kind": "workspace_recovered", "candidate_id": candidate.candidate_id, "candidate_commit": candidate.candidate_commit})
+
+    def _resolved_run_source_repo(self, candidate: Candidate, run: Mapping[str, Any], manager: GitWorktreeManager) -> Path:
+        persisted = run.get("resolved_source_repo")
+        if persisted:
+            repo = Path(str(persisted)).expanduser().resolve()
+            canonical = manager.resolve_source_repo(repo)
+            if canonical != repo:
+                raise OrchestratorError("persisted source repository is not a canonical Git root")
+        else:
+            # Older runs did not persist this identity. Recover only from this run's worktree registry.
+            registered_paths = {
+                manager.resolve_source_repo(entry["source_repo"])
+                for entry in manager.entries()
+                if entry.get("run_id") == candidate.run_id and entry.get("source_repo")
+            }
+            if len(registered_paths) != 1:
+                raise OrchestratorError("legacy run has no unique persisted source repository; refusing to use current configuration")
+            repo = next(iter(registered_paths))
+        base_commit = str(run.get("resolved_base_commit") or candidate.base_commit)
+        if manager.resolve_commit(repo, base_commit) != candidate.base_commit:
+            raise OrchestratorError("resolved source repository/base commit does not match candidate identity")
+        return repo
 
     def _cleanup_run_worktrees(self, run_id: str) -> None:
         manager = GitWorktreeManager(self.config.workspace_parent)

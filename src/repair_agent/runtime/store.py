@@ -42,14 +42,14 @@ _TRANSITIONS: dict[Stage, set[Stage]] = {
     Stage.REPAIRING: {Stage.BATCH_REVIEW, Stage.REVIEW_REQUIRED, Stage.FAILED},
     Stage.BATCH_REVIEW: {Stage.INTEGRATING, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.FAILED},
     Stage.INTEGRATING: {Stage.CANDIDATE_FROZEN, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.FAILED},
-    Stage.CANDIDATE_FROZEN: {Stage.HUMAN_REVIEW, Stage.REPAIRING, Stage.REVIEW_REQUIRED},
-    Stage.HUMAN_REVIEW: {Stage.SUBMITTING, Stage.REPAIRING, Stage.REVIEW_REQUIRED},
+    Stage.CANDIDATE_FROZEN: {Stage.HUMAN_REVIEW, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.RETRY_INFRA},
+    Stage.HUMAN_REVIEW: {Stage.SUBMITTING, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.RETRY_INFRA},
     Stage.SUBMITTING: {Stage.CI_DISPATCHING, Stage.SUBMISSION_UNKNOWN, Stage.REVIEW_REQUIRED, Stage.FAILED},
     Stage.SUBMISSION_UNKNOWN: {Stage.SUBMITTING, Stage.CI_DISPATCHING, Stage.HUMAN_REVIEW, Stage.REVIEW_REQUIRED},
     Stage.CI_DISPATCHING: {Stage.CI_PENDING, Stage.CI_DISPATCH_UNKNOWN, Stage.RETRY_INFRA, Stage.REVIEW_REQUIRED},
     Stage.CI_DISPATCH_UNKNOWN: {Stage.CI_DISPATCHING, Stage.CI_PENDING, Stage.REVIEW_REQUIRED},
     Stage.CI_PENDING: {Stage.VERIFIED, Stage.REPAIRING, Stage.RETRY_INFRA, Stage.REVIEW_REQUIRED, Stage.FAILED},
-    Stage.RETRY_INFRA: {Stage.CI_DISPATCHING, Stage.CI_PENDING, Stage.VERIFIED, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.FAILED},
+    Stage.RETRY_INFRA: {Stage.CI_DISPATCHING, Stage.CI_PENDING, Stage.VERIFIED, Stage.HUMAN_REVIEW, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.FAILED},
     Stage.VERIFIED: {Stage.REVIEW_REQUIRED},
     Stage.REVIEW_REQUIRED: {Stage.REPAIRING, Stage.HUMAN_REVIEW, Stage.VERIFIED, Stage.RETRY_INFRA, Stage.FAILED},
     Stage.FAILED: {Stage.REPAIRING, Stage.REVIEW_REQUIRED},
@@ -567,6 +567,67 @@ class RunStore:
                 persisted = self._persist_validation_locked(result)
                 self._db.commit()
                 return persisted
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def save_local_validation_and_transition(
+        self,
+        result: ValidationResult,
+        *,
+        run_id: str,
+        payload_update: Mapping[str, Any] | None = None,
+    ) -> tuple[ValidationResult, Stage]:
+        """Persist local validation evidence and its candidate-bound run state atomically."""
+        if result.state != ValidationState.FINAL or result.backend.lower() != "local":
+            raise StoreError("local transition requires a final local validation result")
+        target_by_class = {
+            ValidationClass.VALIDATION_PASS: Stage.HUMAN_REVIEW,
+            ValidationClass.CODE_FAIL: Stage.REPAIRING,
+            ValidationClass.INFRA_FAIL: Stage.RETRY_INFRA,
+            ValidationClass.INCONCLUSIVE: Stage.REVIEW_REQUIRED,
+        }
+        failure_by_class = {
+            ValidationClass.CODE_FAIL: "CODE_FAIL",
+            ValidationClass.INFRA_FAIL: "INFRA_FAIL",
+            ValidationClass.INCONCLUSIVE: "INCONCLUSIVE",
+        }
+        allowed_stages = {Stage.CANDIDATE_FROZEN, Stage.HUMAN_REVIEW, Stage.REVIEW_REQUIRED, Stage.RETRY_INFRA}
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                candidate = self.get_candidate(result.candidate_id)
+                if candidate is None or candidate.run_id != run_id:
+                    raise StoreError("local validation run does not match candidate")
+                row = self._db.execute("SELECT stage,payload_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if row is None:
+                    raise StoreError(f"run not found: {run_id}")
+                current = Stage(row["stage"])
+                payload = json.loads(row["payload_json"])
+                if current not in allowed_stages:
+                    raise StoreError(f"local validation cannot update run from stage {current.value}")
+                if payload.get("candidate_id") != result.candidate_id:
+                    raise StoreError("local validation does not match the run's current candidate")
+                if result.classification == ValidationClass.CODE_FAIL and not (payload_update or {}).get("new_attempt_id"):
+                    raise StoreError("code-failing local validation requires a new attempt id")
+                persisted = self._persist_validation_locked(result)
+                target = target_by_class[persisted.classification]
+                if target != current and target not in _TRANSITIONS.get(current, set()):
+                    raise StoreError(f"invalid local validation transition {current.value} -> {target.value}")
+                payload.update(sanitize(payload_update or {}))
+                payload["validation_id"] = persisted.validation_id
+                payload["validation_backend"] = persisted.backend
+                failure = failure_by_class.get(persisted.classification)
+                if failure:
+                    payload["failure_class"] = failure
+                else:
+                    payload.pop("failure_class", None)
+                self._db.execute(
+                    "UPDATE runs SET stage=?,payload_json=?,updated_at=? WHERE run_id=?",
+                    (target.value, canonical_json(sanitize(payload)), utc_now(), run_id),
+                )
+                self._db.commit()
+                return persisted, target
             except Exception:
                 self._db.rollback()
                 raise

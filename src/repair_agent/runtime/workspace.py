@@ -362,8 +362,23 @@ class GitWorktreeManager:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise WorkspaceError(f"git unavailable or timed out: {exc}") from exc
 
+    def resolve_source_repo(self, source_repo: str | Path) -> Path:
+        repo = Path(source_repo).expanduser().resolve()
+        if not repo.is_dir():
+            raise WorkspaceError(f"source repository is not configured: {repo}")
+        result = self._git(["rev-parse", "--show-toplevel"], repo)
+        if result.returncode != 0:
+            raise WorkspaceError(f"source is not a Git repository: {repo}")
+        try:
+            canonical = Path(result.stdout.strip()).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise WorkspaceError(f"cannot resolve Git repository root: {repo}") from exc
+        if not canonical.is_dir():
+            raise WorkspaceError(f"Git repository root is not a directory: {canonical}")
+        return canonical
+
     def resolve_commit(self, source_repo: str | Path, revision: str) -> str:
-        repo = Path(source_repo).resolve()
+        repo = self.resolve_source_repo(source_repo)
         result = self._git(["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], repo)
         commit = result.stdout.strip().lower()
         if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
@@ -377,12 +392,7 @@ class GitWorktreeManager:
             return self._create_locked(task_id=task_id, source_repo=source_repo, base_commit=base_commit, run_id=run_id, role=role)
 
     def _create_locked(self, *, task_id: str, source_repo: str | Path, base_commit: str, run_id: str, role: str) -> WorktreeHandle:
-        repo = Path(source_repo).resolve()
-        if not repo.is_dir():
-            raise WorkspaceError(f"source repository is not configured: {repo}")
-        root = self._git(["rev-parse", "--show-toplevel"], repo)
-        if root.returncode != 0:
-            raise WorkspaceError(f"source is not a Git repository: {repo}")
+        repo = self.resolve_source_repo(source_repo)
         target = (self.parent / task_id).resolve()
         target.relative_to(self.parent)
         if target.exists():

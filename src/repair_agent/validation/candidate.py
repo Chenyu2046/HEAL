@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import uuid
+import logging
 import os
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
 from ..config import ToolLimits
-from ..domain import BatchProposal, Candidate, canonical_json, sha256_bytes, sha256_text, to_primitive, utc_now
+from ..domain import BatchProposal, Candidate, canonical_json, redact_text, sha256_bytes, sha256_text, to_primitive, utc_now
 from ..runtime.store import RunStore, StoreError
 from ..runtime.workspace import WorkspaceError, git_tree_oid, tree_hash
 from .scope import PatchScopeGuard
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class CandidateError(RuntimeError):
@@ -69,50 +73,68 @@ class CandidateFreezer:
         )
         if resolved_tree.returncode != 0 or resolved_tree.stdout.strip() != tree_oid:
             raise CandidateError("candidate commit does not resolve to the frozen Git tree")
+        ref_name = f"refs/heal/candidates/{candidate_id}"
         anchored = subprocess.run(
-            ["git", "update-ref", f"refs/heal/candidates/{candidate_id}", candidate_commit],
+            ["git", "update-ref", ref_name, candidate_commit, "0" * len(candidate_commit)],
             cwd=workspace, text=True, capture_output=True, check=False, timeout=30,
         )
         if anchored.returncode != 0:
             raise CandidateError(f"cannot anchor candidate commit: {anchored.stderr.strip()}")
-        diff_result = subprocess.run(["git", "diff", "--cached", "--binary", "--no-ext-diff", "--no-color", base_commit, "--"], cwd=workspace, text=True, capture_output=True, check=False, timeout=60)
-        files_result = subprocess.run(["git", "diff", "--cached", "--name-only", "-z", base_commit, "--"], cwd=workspace, capture_output=True, check=False, timeout=30)
-        if diff_result.returncode != 0 or files_result.returncode != 0:
-            raise CandidateError(f"cannot read integrated candidate diff: {(diff_result.stderr or files_result.stderr.decode(errors='replace')).strip()}")
-        diff = diff_result.stdout
-        changed_files = tuple(sorted({item.decode("utf-8", errors="replace") for item in files_result.stdout.split(b"\0") if item}))
-        scope = self.scope_guard.inspect(diff, changed_files)
-        if scope.violations:
-            raise CandidateError("integrated patch scope requires review: " + "; ".join(scope.violations))
-        report = {
-            "run_id": run_id,
-            "base_commit": base_commit,
-            "tree_hash": actual_tree_hash,
-            "git_tree_oid": tree_oid,
-            "candidate_commit": candidate_commit,
-            "proposals": [to_primitive(proposal) for proposal in proposal_list],
-            "patch_scope": to_primitive(scope),
-            "finding_ids": sorted(set(finding_ids)),
-            "created_at": utc_now(),
-        }
-        report_json = canonical_json(report)
-        artifact_hash = sha256_bytes(diff.encode("utf-8"))
-        report_hash = sha256_text(report_json)
-        diff_artifact = self.store.save_artifact(run_id, f"{candidate_id}-diff", "candidate-diff", diff, {"tree_hash": actual_tree_hash})
-        report_artifact = self.store.save_artifact(run_id, f"{candidate_id}-report", "candidate-report", report_json, {"tree_hash": actual_tree_hash})
-        suppression_ids = tuple(sorted({finding_id for proposal in proposal_list for finding_id, action in proposal.action_map.items() if getattr(action, "value", str(action)) == "SUPPRESSION_CANDIDATE"}))
-        candidate = Candidate(
-            candidate_id=candidate_id, run_id=run_id, base_commit=base_commit,
-            tree_hash=actual_tree_hash, artifact_hash=artifact_hash, report_hash=report_hash,
-            changed_files=changed_files,
-            finding_ids=tuple(sorted(set(finding_ids))), git_tree_oid=tree_oid,
-            candidate_commit=candidate_commit, suppression_candidate_ids=suppression_ids,
-        )
-        artifact_ids = [diff_artifact["artifact_id"], report_artifact["artifact_id"]]
         try:
+            diff_result = subprocess.run(["git", "diff", "--cached", "--binary", "--no-ext-diff", "--no-color", base_commit, "--"], cwd=workspace, text=True, capture_output=True, check=False, timeout=60)
+            files_result = subprocess.run(["git", "diff", "--cached", "--name-only", "-z", base_commit, "--"], cwd=workspace, capture_output=True, check=False, timeout=30)
+            if diff_result.returncode != 0 or files_result.returncode != 0:
+                raise CandidateError(f"cannot read integrated candidate diff: {(diff_result.stderr or files_result.stderr.decode(errors='replace')).strip()}")
+            diff = diff_result.stdout
+            changed_files = tuple(sorted({item.decode("utf-8", errors="replace") for item in files_result.stdout.split(b"\0") if item}))
+            scope = self.scope_guard.inspect(diff, changed_files)
+            if scope.violations:
+                raise CandidateError("integrated patch scope requires review: " + "; ".join(scope.violations))
+            report = {
+                "run_id": run_id,
+                "base_commit": base_commit,
+                "tree_hash": actual_tree_hash,
+                "git_tree_oid": tree_oid,
+                "candidate_commit": candidate_commit,
+                "proposals": [to_primitive(proposal) for proposal in proposal_list],
+                "patch_scope": to_primitive(scope),
+                "finding_ids": sorted(set(finding_ids)),
+                "created_at": utc_now(),
+            }
+            report_json = canonical_json(report)
+            artifact_hash = sha256_bytes(diff.encode("utf-8"))
+            report_hash = sha256_text(report_json)
+            diff_artifact = self.store.save_artifact(run_id, f"{candidate_id}-diff", "candidate-diff", diff, {"tree_hash": actual_tree_hash})
+            report_artifact = self.store.save_artifact(run_id, f"{candidate_id}-report", "candidate-report", report_json, {"tree_hash": actual_tree_hash})
+            suppression_ids = tuple(sorted({finding_id for proposal in proposal_list for finding_id, action in proposal.action_map.items() if getattr(action, "value", str(action)) == "SUPPRESSION_CANDIDATE"}))
+            candidate = Candidate(
+                candidate_id=candidate_id, run_id=run_id, base_commit=base_commit,
+                tree_hash=actual_tree_hash, artifact_hash=artifact_hash, report_hash=report_hash,
+                changed_files=changed_files,
+                finding_ids=tuple(sorted(set(finding_ids))), git_tree_oid=tree_oid,
+                candidate_commit=candidate_commit, suppression_candidate_ids=suppression_ids,
+            )
+            artifact_ids = [diff_artifact["artifact_id"], report_artifact["artifact_id"]]
             self.store.save_frozen_candidate(candidate, artifact_ids)
-        except StoreError as exc:
-            raise CandidateError(f"cannot atomically commit frozen candidate and checkpoint: {exc}") from exc
+        except Exception as exc:
+            cleanup_error = None
+            try:
+                removed = subprocess.run(
+                    ["git", "update-ref", "-d", ref_name, candidate_commit],
+                    cwd=workspace, text=True, capture_output=True, check=False, timeout=30,
+                )
+                if removed.returncode != 0:
+                    cleanup_error = removed.stderr.strip() or f"git exited with status {removed.returncode}"
+            except (OSError, subprocess.TimeoutExpired) as cleanup_exc:
+                cleanup_error = f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+            if cleanup_error:
+                safe_error = redact_text(cleanup_error)
+                _LOG.warning("candidate ref cleanup failed for %s: %s", candidate_id, safe_error)
+                if hasattr(exc, "add_note"):
+                    exc.add_note(f"candidate ref cleanup failed: {safe_error}")
+            if isinstance(exc, StoreError):
+                raise CandidateError(f"cannot atomically commit frozen candidate and checkpoint: {exc}") from exc
+            raise
         return FreezeResult(candidate, tuple(artifact_ids))
 
     def assert_current(self, candidate: Candidate, workspace: Path) -> None:
