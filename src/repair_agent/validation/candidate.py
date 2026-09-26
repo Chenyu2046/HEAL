@@ -37,6 +37,9 @@ class CandidateFreezer:
 
     def freeze(self, *, run_id: str, workspace: Path, base_commit: str, proposals: Iterable[BatchProposal], finding_ids: Iterable[str]) -> FreezeResult:
         proposal_list = tuple(proposals)
+        # finding_ids 可能是调用方传入的生成器;在这里物化一次,Report 与 Candidate
+        # 两处消费才不会出现"第一次耗尽、第二次为空"的身份缺口。
+        finding_id_list = tuple(finding_ids)
         if not proposal_list:
             raise CandidateError("cannot freeze without integrated batch proposals")
         incomplete = [proposal.batch_id for proposal in proposal_list if not proposal.complete or proposal.unresolved or proposal.not_executed]
@@ -98,7 +101,7 @@ class CandidateFreezer:
                 "candidate_commit": candidate_commit,
                 "proposals": [to_primitive(proposal) for proposal in proposal_list],
                 "patch_scope": to_primitive(scope),
-                "finding_ids": sorted(set(finding_ids)),
+                "finding_ids": sorted(set(finding_id_list)),
                 "created_at": utc_now(),
             }
             report_json = canonical_json(report)
@@ -111,7 +114,7 @@ class CandidateFreezer:
                 candidate_id=candidate_id, run_id=run_id, base_commit=base_commit,
                 tree_hash=actual_tree_hash, artifact_hash=artifact_hash, report_hash=report_hash,
                 changed_files=changed_files,
-                finding_ids=tuple(sorted(set(finding_ids))), git_tree_oid=tree_oid,
+                finding_ids=tuple(sorted(set(finding_id_list))), git_tree_oid=tree_oid,
                 candidate_commit=candidate_commit, suppression_candidate_ids=suppression_ids,
             )
             artifact_ids = [diff_artifact["artifact_id"], report_artifact["artifact_id"]]

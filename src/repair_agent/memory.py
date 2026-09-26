@@ -7,11 +7,18 @@ import os
 import tempfile
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
 from .domain import ActionKind, Observation, RiskClass, canonical_json, sha256_text, utc_now
+from .runtime.workspace import WorkspaceError
+
+if TYPE_CHECKING:  # 仅类型标注;运行时不需要,避免引入更重的依赖面
+    from .runtime.workspace import WorkspaceState
+
+# 置信度探测读取源文件的上限,对齐 ToolLimits.max_file_bytes 默认值。
+_EPISODE_PROBE_MAX_BYTES = 256_000
 
 
 @dataclass
@@ -74,17 +81,43 @@ class Episode:
     human_review: str
     ci_result: str
     created_at: str = field(default_factory=utc_now)
+    # --- Phase 3(方案 §11/§13/§14)结构化字段:全部带默认值,旧 JSON(上面 11 个
+    # 字段)仍可直接 Episode(**json) 读取;追加在 created_at 之后以保持旧的位置
+    # 参数构造兼容。 ---
+    trigger_rule: str = ""
+    trigger_module: str = ""
+    trigger_symbol: str = ""
+    warning_signature: str = ""
+    root_cause: str = ""
+    evidence_summary: str = ""
+    fix_summary: str = ""
+    changed_files: tuple[str, ...] = ()
+    validation_feedback: str = ""
+    build_result: str = ""
+    ut_result: str = ""
+    scan_result: str = ""
+    validated: bool = False
+    # confidence 是 retrieve() 的输出字段:按当前 workspace 做词法探测后经
+    # dataclasses.replace 填充(HIGH/MEDIUM/STALE),落盘时恒为空字符串。
+    confidence: str = ""
+    schema_version: str = "1"
 
 
 class EpisodeStore:
     """JSON episode files keep the initial store inspectable and dependency-free."""
 
-    def __init__(self, root: str | Path, worker_id: str | None = None, task_id: str | None = None) -> None:
+    def __init__(self, root: str | Path, worker_id: str | None = None, task_id: str | None = None, *, experience_only: bool = False) -> None:
         base = Path(root).resolve()
         self.root = base / "tasks" / (task_id or "_unbound") / (worker_id or "default")
         self.experience_root = base / "experience"
-        self.root.mkdir(parents=True, exist_ok=True)
+        if not experience_only:
+            self.root.mkdir(parents=True, exist_ok=True)
         self.experience_root.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def for_experience(cls, root: str | Path) -> "EpisodeStore":
+        """共享经验库绑定(方案 §12):不创建 task/worker 沙箱目录,只保证 experience_root 可用。"""
+        return cls(root, experience_only=True)
 
     def store_candidate(self, episode: Episode) -> Path:
         if episode.human_review not in {"APPROVED", "REJECTED", "PENDING"}:
@@ -134,12 +167,24 @@ class EpisodeStore:
         rule: str | None,
         keywords: tuple[str, ...],
         source_commit: str,
-        limit: int = 5,
+        symbol: str | None = None,
+        warning_signature: str | None = None,
+        workspace: "WorkspaceState | None" = None,
+        limit: int = 3,
         deadline: float | None = None,
     ) -> tuple[Episode, ...]:
-        scored: list[tuple[int, Episode]] = []
+        """方案 §13 的结构化评分检索(无向量搜索):
+
+        score = same_rule*4 + same_module*3 + same_symbol*3 + warning_match*2
+                + keyword_hit*1 + validated*1
+        source_commit 完全相等按 §14 改为 +2 加分项(不再硬过滤);repo 仍是
+        provenance 硬过滤,module/rule 通配过滤保留。workspace 提供时按 §14 做
+        词法级置信度探测(见 _probe_symbol_confidence),HIGH 额外 +1。取 Top
+        ``limit``(默认 3)。
+        """
         wanted = {word.lower() for word in keywords if word}
         paths = sorted(set(self.root.glob("*.json")) | set(self.experience_root.glob("*.json")))
+        scored: list[tuple[int, str, Episode]] = []
         for path in paths:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("memory retrieval stopped at the workspace deadline")
@@ -153,17 +198,65 @@ class EpisodeStore:
                 raise TimeoutError("memory retrieval stopped at the workspace deadline")
             if episode.repo != repo or (module and episode.module not in {module, "*"}) or (rule and episode.rule not in {rule, "*"}):
                 continue
-            if source_commit and episode.source_commit != source_commit:
-                continue
-            overlap = wanted.intersection(word.lower() for word in episode.keywords)
-            score = len(overlap) * 3
-            if episode.source_commit == source_commit:
-                score += 2
-            if episode.human_review == "APPROVED":
-                score += 1
-            scored.append((score, episode))
-        scored.sort(key=lambda item: (-item[0], item[1].created_at))
-        return tuple(item[1] for item in scored[:limit])
+            confidence = ""
+            if workspace is not None:
+                confidence = _probe_symbol_confidence(
+                    workspace,
+                    file=episode.changed_files[0] if episode.changed_files else None,
+                    symbol=episode.trigger_symbol or None,
+                )
+                episode = replace(episode, confidence=confidence)
+            score = 0
+            if rule and episode.rule == rule:
+                score += 4  # same_rule
+            if module and episode.module == module:
+                score += 3  # same_module
+            if symbol and episode.trigger_symbol and episode.trigger_symbol == symbol:
+                score += 3  # same_symbol
+            if warning_signature and episode.warning_signature and episode.warning_signature == warning_signature:
+                score += 2  # warning_match
+            score += len(wanted.intersection(word.lower() for word in episode.keywords))
+            if episode.validated:
+                score += 1  # validated
+            if source_commit and episode.source_commit == source_commit:
+                score += 2  # §14:source_commit 完全相等是加分项,不是过滤器
+            if confidence == "HIGH":
+                score += 1  # 置信度小幅加成
+            scored.append((score, episode.created_at, episode))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return tuple(item[2] for item in scored[: max(0, limit)])
+
+
+def _probe_symbol_confidence(workspace: "WorkspaceState", *, file: str | None, symbol: str | None) -> str:
+    """词法级置信度判断(方案 §14),不是语义分析。
+
+    HIGH = 当前文件仍被符号扫描器扫到该符号(精确名或 Class::name 后缀);
+    STALE = 文件不存在(含受保护/逃逸路径)或扫描结果中符号已消失;
+    MEDIUM = 无 file/symbol、文件超限、读取失败或扫描不到任何声明——扫描器
+    对宏/typedef 有漏报天花板,此时诚实地说"无法判断"而不是猜 HIGH/STALE。
+    """
+    if not file or not symbol:
+        return "MEDIUM"
+    try:
+        path = workspace.resolve(file)
+    except WorkspaceError:
+        return "STALE"
+    try:
+        if not path.is_file():
+            return "STALE"
+        if path.stat().st_size > _EPISODE_PROBE_MAX_BYTES:
+            return "MEDIUM"
+        # 函数级导入:tools/__init__ 经 executor 反向依赖本模块,顶层导入会成环。
+        from .tools.symbols import scan_symbols
+
+        decls = scan_symbols(path.read_bytes().decode("utf-8", errors="replace"))
+    except OSError:
+        return "MEDIUM"
+    if not decls:
+        return "MEDIUM"
+    if any(decl.name == symbol or decl.name.endswith("::" + symbol) for decl in decls):
+        return "HIGH"
+    return "STALE"
 
 
 def episode_candidate_id(repo: str, rule: str, summary: str) -> str:

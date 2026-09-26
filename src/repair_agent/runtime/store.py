@@ -300,6 +300,14 @@ class RunStore:
             self._db.execute("INSERT OR REPLACE INTO artifacts(artifact_id, run_id, kind, path, sha256, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (artifact_id, run_id, kind, str(target), digest, canonical_json(metadata or {}), utc_now()))
         return record
 
+    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        """Artifact record lookup (path + sha256); content integrity is the caller's check."""
+        with self._lock:
+            row = self._db.execute("SELECT artifact_id, run_id, kind, path, sha256, metadata_json, created_at FROM artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
+            if row is None:
+                return None
+            return {"artifact_id": row["artifact_id"], "run_id": row["run_id"], "kind": row["kind"], "path": row["path"], "sha256": row["sha256"], "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]}
+
     def save_checkpoint(self, run_id: str, checkpoint_id: str, stage: Stage, artifact_ids: list[str], payload: Mapping[str, Any]) -> None:
         with self._lock, self._db:
             self._db.execute("INSERT OR REPLACE INTO checkpoints(checkpoint_id, run_id, stage, artifact_ids_json, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", (checkpoint_id, run_id, stage.value, canonical_json(artifact_ids), canonical_json(sanitize(payload)), utc_now()))

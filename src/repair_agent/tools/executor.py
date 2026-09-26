@@ -105,7 +105,7 @@ class ToolExecutor:
         self._register(ToolSpec("edit_file", "Replace one uniquely matched old text after hash validation.", False, ("path", "expected_hash", "old_text", "new_text"), False, {"path": {"type": "string"}, "expected_hash": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}), edit.edit_file)
         self._register(ToolSpec("git_diff", "Read the actual Git working-tree diff.", True), source.git_diff)
         self._register(ToolSpec("read_guideline", "Read a versioned Skill guideline.", True, ("skill_id",), True, {"skill_id": {"type": "string"}}), self._read_guideline)
-        self._register(ToolSpec("memory_retrieve", "Retrieve provenance-bound historical episodes.", True, (), False, {"repo": {"type": "string"}, "module": {"type": "string"}, "rule": {"type": "string"}, "keywords": {"type": "array", "items": {"type": "string"}}, "source_commit": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}), self._memory_retrieve)
+        self._register(ToolSpec("memory_retrieve", "Retrieve historical repair episodes with lexical confidence checks against the current workspace; results are provenance-bound and ranked by structured scoring.", True, (), False, {"repo": {"type": "string"}, "module": {"type": "string"}, "rule": {"type": "string"}, "keywords": {"type": "array", "items": {"type": "string"}}, "symbol": {"type": "string"}, "source_commit": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}), self._memory_retrieve)
 
     def _register(self, spec: ToolSpec, handler: Handler) -> None:
         self.registry.register(spec)
@@ -167,7 +167,9 @@ class ToolExecutor:
             rule=str(arguments.get("rule")) if arguments.get("rule") else None,
             keywords=tuple(str(item) for item in arguments.get("keywords", ())),
             source_commit=str(arguments.get("source_commit", "")),
-            limit=min(10, int(arguments.get("limit", 5))),
+            symbol=str(arguments["symbol"]) if arguments.get("symbol") else None,
+            workspace=self.workspace,
+            limit=min(10, int(arguments.get("limit", 3))),
             deadline=float(arguments["_deadline"]) if arguments.get("_deadline") is not None else None,
         )
         if not episodes:

@@ -36,6 +36,7 @@ from .domain import (
     to_primitive,
     utc_now,
 )
+from .experience import ExperienceWriter
 from .memory import EpisodeStore
 from .models import ModelAdapter, ScriptedModel
 from .planning import BatchPlanner, InputNormalizer, WorkingBatch, ConflictAwareScheduler
@@ -565,6 +566,7 @@ class RepairOrchestrator:
             validation_payload["new_attempt_id"] = f"attempt-{uuid.uuid4().hex}"
         result, target_stage = self.store.save_validation_and_transition(result, run_id=candidate.run_id, payload_update=validation_payload)
         if target_stage == Stage.VERIFIED:
+            self._write_experience(candidate.run_id, candidate.candidate_id)
             self._cleanup_run_worktrees(candidate.run_id)
         return result
 
@@ -639,6 +641,8 @@ class RepairOrchestrator:
             if validation is not None:
                 _, target_stage = self.store.save_validation_and_transition(validation, run_id=run_id, payload_update={"recovered_validation_transition": True}, require_accumulator=recovered_from_accumulator)
                 if target_stage == Stage.VERIFIED:
+                    if candidate is not None:
+                        self._write_experience(run_id, candidate.candidate_id)
                     self._cleanup_run_worktrees(run_id)
                 run = self.store.get_run(run_id) or run
         if run["stage"] in {Stage.SUBMITTING.value, Stage.SUBMISSION_UNKNOWN.value}:
@@ -824,6 +828,26 @@ class RepairOrchestrator:
         if manager.resolve_commit(repo, base_commit) != candidate.base_commit:
             raise OrchestratorError("resolved source repository/base commit does not match candidate identity")
         return repo
+
+    def _write_experience(self, run_id: str, candidate_id: str) -> None:
+        """方案 §12:VERIFIED 后沉淀经验到共享 experience 存储。
+
+        写入失败只 record_trace,绝不影响主流程(不 raise);trace 记录本身再失败
+        也只能吞掉——经验沉淀是尽力而为的旁路,验证结论不受它影响。
+        """
+        try:
+            writer = ExperienceWriter(EpisodeStore.for_experience(self.config.memory_root))
+            written = writer.record_verified_run(self.store, run_id=run_id, candidate_id=candidate_id)
+        except Exception as exc:
+            try:
+                self.store.record_trace(run_id, {"kind": "experience_write_failed", "candidate_id": candidate_id, "error": f"{type(exc).__name__}: {exc}"})
+            except Exception:
+                pass
+            return
+        try:
+            self.store.record_trace(run_id, {"kind": "experience_written", "candidate_id": candidate_id, "episodes": list(written)})
+        except Exception:
+            pass
 
     def _cleanup_run_worktrees(self, run_id: str) -> None:
         manager = GitWorktreeManager(self.config.workspace_parent)
