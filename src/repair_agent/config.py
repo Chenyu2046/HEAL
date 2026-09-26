@@ -45,6 +45,7 @@ class Config:
     memory_root: str = ".repair-agent/memory"
     max_workers: int = 2
     chunking_enabled: bool = False
+    context_cache_enabled: bool = True
     budget: Budget = field(default_factory=Budget)
     tools: ToolLimits = field(default_factory=ToolLimits)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -111,6 +112,7 @@ def load_config(path: str | Path | None = None) -> Config:
         memory_root=str(raw.get("memory_root", ".repair-agent/memory")),
         max_workers=int(raw.get("max_workers", 2)),
         chunking_enabled=bool(raw.get("chunking_enabled", False)),
+        context_cache_enabled=bool(raw.get("context_cache_enabled", True)),
         budget=_budget(raw.get("budget")),
         tools=ToolLimits(**tool_values),
         model=ModelConfig(**model_values),

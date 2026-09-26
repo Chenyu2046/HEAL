@@ -15,6 +15,7 @@ from .adapters.gerrit import GerritAdapter, NotConfiguredGerritAdapter, Submissi
 from .agent import AgentLoop, AgentResult
 from .concurrency import IntegrationEngine, WorkerPool, requeue_for_expanded_scope
 from .config import Config
+from .context import ContextCache
 from .domain import (
     BatchProposal,
     Candidate,
@@ -318,7 +319,8 @@ class RepairOrchestrator:
             skill_store = SkillStore(self.config.skill_root)
             isolated_worker_id = f"{worker_id}-{batch.batch_id}-{uuid.uuid4().hex[:8]}"
             episode_store = EpisodeStore(self.config.memory_root, worker_id=isolated_worker_id, task_id=task.task_id)
-            executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store)
+            cache = ContextCache() if self.config.context_cache_enabled else None
+            executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store, cache=cache)
             router = SkillRouter(skill_store)
             model = self.model_factory(task, isolated_worker_id)
             loop = AgentLoop(task, worker_id=isolated_worker_id, model=model, executor=executor, skill_router=router, chunking_enabled=self.config.chunking_enabled, retry_policy=RetryPolicy(self.config.model.max_retries), tool_limits=self.config.tools, max_recent_observations=self.config.max_recent_observations, max_observation_chars=self.config.max_observation_chars, max_skill_context_chars=self.config.max_skill_context_chars, max_skill_scan_bytes=self.config.max_skill_scan_bytes, trace_callback=lambda observation: self.store.record_trace(task.run_id, {"worker_id": isolated_worker_id, "batch_id": batch.batch_id, "observation": _observation_trace(observation)}), usage_callback=lambda usage: self.store.update_worker_budget(task.run_id, isolated_worker_id, to_primitive(usage)), budget_started_at=budget_started_at)

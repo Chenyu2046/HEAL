@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from ..config import ToolLimits
+from ..context import ContextCache
 from ..domain import Observation, ToolStatus, canonical_json
 from ..memory import EpisodeStore
 from ..models import ToolCall
@@ -82,15 +83,17 @@ class ToolExecutor:
         limits: ToolLimits | None = None,
         skill_store: SkillStore | None = None,
         episode_store: EpisodeStore | None = None,
+        cache: ContextCache | None = None,
     ) -> None:
         self.workspace = workspace
         self.limits = limits or ToolLimits()
         self.skill_store = skill_store
         self.episode_store = episode_store
+        self.cache = cache
         self.registry = ToolRegistry()
         self._write_lock = threading.Lock()
         self._handlers: dict[str, Handler] = {}
-        source = SourceTools(workspace, max_file_bytes=self.limits.max_file_bytes, max_output_chars=self.limits.max_output_chars, max_search_results=self.limits.max_search_results)
+        source = SourceTools(workspace, max_file_bytes=self.limits.max_file_bytes, max_output_chars=self.limits.max_output_chars, max_search_results=self.limits.max_search_results, cache=cache)
         edit = EditTool(workspace, max_file_bytes=self.limits.max_file_bytes)
         self._register(ToolSpec("read_file", "Read a bounded UTF-8 source range.", True, ("path",), True, {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}, "max_chars": {"type": "integer", "minimum": 1}}), source.read_file)
         self._register(ToolSpec("search_code", "Text search only; not complete C++ semantic navigation.", True, ("query",), True, {"query": {"type": "string", "minLength": 1}, "paths": {"type": "array", "items": {"type": "string"}}, "max_results": {"type": "integer", "minimum": 1}}), source.search_code)

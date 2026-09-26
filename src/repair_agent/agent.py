@@ -23,7 +23,7 @@ from .domain import (
     to_primitive,
 )
 from .config import ToolLimits
-from .memory import BatchCache, TaskStateMemory
+from .memory import TaskStateMemory
 from .models import ModelAdapter, ModelDeadlineExceeded, ModelDecision, ModelError, ModelProtocolError, ToolCall
 from .skills import SkillContextError, SkillRouter
 from .retry import RetryPolicy
@@ -156,7 +156,6 @@ class AgentLoop:
         self.usage_callback = usage_callback
         self.budget_started_at = budget_started_at
         self.chunk_executor = ChunkExecutor()
-        self.cache = BatchCache()
 
     def run(self, batch_id: str, issues: Sequence[Issue]) -> AgentResult:
         self._blocking_tool_failures = []
@@ -241,8 +240,6 @@ class AgentLoop:
                 self._persist_usage(usage)
                 observation = self.executor.execute(decision.tool_call, expected_workspace_revision=self.executor.workspace.revision, deadline=usage.started_at + self.task.budget.max_wall_seconds)
                 self._record(observation, observations, memory)
-                if observation.status == ToolStatus.OK and decision.tool_call.name == "edit_file":
-                    self.cache.invalidate(set(observation.source_paths))
                 state["workspace_revision"] = self.executor.workspace.revision
                 continue
 

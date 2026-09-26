@@ -8,6 +8,7 @@
 - ActionChunk / ChunkExecutor / BoundaryDetector with default-off integration and conservative stop behavior.
 - Bounded homogeneous workers, independent Git worktree creation, known-range conflict scheduling, serial integration, expanded-scope and semantic-review warnings.
 - Task State, revision/hash-bound Batch Cache, isolated Worker Episode Store, keyword/metadata retrieval, provenance fields, and versioned Skill routing.
+- Version-checked Context Cache (per-worker `ContextCache` facade): full-text `read_file` replay and non-empty complete-scan `search_code` replay validated against touched-file hashes, 64-entry LRU regions, `context_cache_enabled` switch; PARTIAL and EMPTY scans are not replayed in v1.
 - Batch Proposal, serial integration, tree-hash Candidate Freeze, candidate-bound approval, independent result classification, and code/infra/inconclusive separation.
 - SQLite RunStore, atomic artifact writes, trace redaction, checkpoints, artifact reconciliation, submission intents, `SUBMISSION_UNKNOWN`, and CI identity deduplication.
 - CLI, JSON configuration, Markdown/JSON reporting, and explicit unconfigured Gerrit/CI boundaries.
