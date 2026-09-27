@@ -324,7 +324,7 @@ class RepairOrchestrator:
             cache = ContextCache() if self.config.context_cache_enabled else None
             # 排序上下文 = 当前 batch issues 的 symbol/module/analysis_trace 词元
             # (方案 §7);缺省(空上下文)时 search_code 不加分。
-            executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store, cache=cache, ranking_context=SearchRankingContext.from_issues(batch.issues))
+            executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store, cache=cache, ranking_context=SearchRankingContext.from_issues(batch.issues), check_specs=self.config.checks, check_command_prefix=self.config.check_command_prefix)
             router = SkillRouter(skill_store)
             model = self.model_factory(task, isolated_worker_id)
             loop = AgentLoop(task, worker_id=isolated_worker_id, model=model, executor=executor, skill_router=router, chunking_enabled=self.config.chunking_enabled, retry_policy=RetryPolicy(self.config.model.max_retries), tool_limits=self.config.tools, max_recent_observations=self.config.max_recent_observations, max_observation_chars=self.config.max_observation_chars, max_skill_context_chars=self.config.max_skill_context_chars, max_skill_scan_bytes=self.config.max_skill_scan_bytes, trace_callback=lambda observation: self.store.record_trace(task.run_id, {"worker_id": isolated_worker_id, "batch_id": batch.batch_id, "observation": _observation_trace(observation)}), usage_callback=lambda usage: self.store.update_worker_budget(task.run_id, isolated_worker_id, to_primitive(usage)), budget_started_at=budget_started_at)
@@ -350,6 +350,7 @@ class RepairOrchestrator:
             "max_context_files": max(0, total.max_context_files - int(used.get("context_files", 0))),
             "max_symbol_expansions": max(0, total.max_symbol_expansions - int(used.get("symbol_expansions", 0))),
             "max_search_rounds": max(0, total.max_search_rounds - int(used.get("search_rounds", 0))),
+            "max_check_runs": max(0, total.max_check_runs - int(used.get("check_runs", 0))),
         }
         allocated: dict[str, Budget] = {}
         for index, batch in enumerate(slot):
@@ -681,6 +682,7 @@ class RepairOrchestrator:
             "max_context_files": max(0, int(budget.get("max_context_files", self.config.budget.max_context_files)) - int(used.get("context_files", 0))),
             "max_symbol_expansions": max(0, int(budget.get("max_symbol_expansions", self.config.budget.max_symbol_expansions)) - int(used.get("symbol_expansions", 0))),
             "max_search_rounds": max(0, int(budget.get("max_search_rounds", self.config.budget.max_search_rounds)) - int(used.get("search_rounds", 0))),
+            "max_check_runs": max(0, int(budget.get("max_check_runs", self.config.budget.max_check_runs)) - int(used.get("check_runs", 0))),
         }
         return {"run": run, "recovery_issues": issues, "action": action, "budget_remaining": remaining, "submission_intents": [to_primitive(item) for candidate in candidates for item in self.store.list_submissions(candidate.candidate_id)]}
 

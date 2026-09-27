@@ -55,6 +55,7 @@ def _safe_review_reason(reason: str) -> str:
         "tool call budget exhausted during action chunk", "wall-clock budget exhausted during action chunk",
         "model request attempt budget exhausted",
         "search round budget exhausted", "symbol expansion budget exhausted", "context file budget exhausted",
+        "check run budget exhausted",
         "skill context limit exceeded",
         "skill context deadline exceeded",
     }
@@ -89,6 +90,33 @@ def _safe_review_reason(reason: str) -> str:
     return "worker requires review; inspect outcome metadata"
 
 
+def _check_summary_note(observations: Sequence[Observation]) -> str | None:
+    """One bounded note with per-check last verdicts (tech-design §1.8); display metadata only."""
+    verdicts: dict[str, Mapping[str, Any]] = {}
+    for item in observations:
+        if item.tool != "run_checks" or not isinstance(item.content, Mapping):
+            continue
+        entries = item.content.get("checks")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, Mapping) and entry.get("name"):
+                verdicts[str(entry["name"])] = entry  # last verdict wins
+    if not verdicts:
+        return None
+    parts = []
+    for name in sorted(verdicts)[:8]:
+        entry = verdicts[name]
+        verdict = str(entry.get("verdict") or "")
+        returncode = entry.get("returncode")
+        error = str(entry.get("error") or "").strip()
+        if verdict in {"PASS", "FAIL"} and isinstance(returncode, int):
+            parts.append(f"{name}={verdict}(exit {returncode})")
+        else:
+            parts.append(f"{name}={verdict or 'INFRA_FAIL'}({error or 'unknown'})")
+    return "In-loop checks: " + ", ".join(parts)
+
+
 @dataclass
 class AgentUsage:
     model_calls: int = 0
@@ -104,6 +132,7 @@ class AgentUsage:
     search_rounds: int = 0
     symbol_expansions: int = 0
     context_files: int = 0
+    check_runs: int = 0
     elapsed_seconds: float = 0.0
     started_at: float = 0.0
     retry_events: list[dict[str, Any]] = field(default_factory=list)
@@ -119,6 +148,7 @@ class AgentUsage:
             and self.search_rounds < budget.max_search_rounds
             and self.symbol_expansions < budget.max_symbol_expansions
             and self.context_files < budget.max_context_files
+            and self.check_runs < budget.max_check_runs
             and time.monotonic() - self.started_at < budget.max_wall_seconds
         )
 
@@ -248,7 +278,11 @@ class AgentLoop:
                 return self._review(batch_id, usage, observations, "token budget exhausted")
 
             if decision.kind == "tool_call" and decision.tool_call is not None:
-                blocked = self._tool_budget_error(usage, decision.tool_call.name)
+                requested_check_runs = 0
+                if decision.tool_call.name == "run_checks":
+                    raw_names = decision.tool_call.arguments.get("names") if isinstance(decision.tool_call.arguments, Mapping) else None
+                    requested_check_runs = len(raw_names) if isinstance(raw_names, list) else 0
+                blocked = self._tool_budget_error(usage, decision.tool_call.name, requested_check_runs=requested_check_runs)
                 if blocked:
                     return self._review(batch_id, usage, observations, blocked)
                 usage.tool_calls += 1
@@ -261,6 +295,10 @@ class AgentLoop:
                 self._persist_usage(usage)
                 observation = self.executor.execute(decision.tool_call, expected_workspace_revision=self.executor.workspace.revision, deadline=usage.started_at + self.task.budget.max_wall_seconds)
                 self._record(observation, observations, memory, usage)
+                if decision.tool_call.name == "run_checks" and isinstance(observation.content, Mapping) and isinstance(observation.content.get("checks"), list):
+                    # executed checks burn budget; pre-execution rejections carry no "checks" list and burn none
+                    usage.check_runs += len(observation.content["checks"])
+                    self._persist_usage(usage)
                 state["workspace_revision"] = self.executor.workspace.revision
                 continue
 
@@ -324,6 +362,8 @@ class AgentLoop:
             reasons.append("symbol expansion budget exhausted")
         if usage.context_files >= self.task.budget.max_context_files:
             reasons.append("context file budget exhausted")
+        if usage.check_runs >= self.task.budget.max_check_runs:
+            reasons.append("check run budget exhausted")
         if time.monotonic() - usage.started_at >= self.task.budget.max_wall_seconds:
             reasons.append("wall-clock budget exhausted")
         return self._review(batch_id, usage, observations, "; ".join(reasons) or "budget exhausted")
@@ -360,7 +400,7 @@ class AgentLoop:
         usage.retry_events.append({"category": error.category, "attempt": usage.model_attempts, "delay_seconds": round(delay, 3)})
         self._persist_usage(usage)
 
-    def _tool_budget_error(self, usage: AgentUsage, name: str) -> str | None:
+    def _tool_budget_error(self, usage: AgentUsage, name: str, requested_check_runs: int = 0) -> str | None:
         if usage.tool_calls >= self.task.budget.max_tool_calls:
             return "tool call budget exhausted"
         if name == "edit_file" and usage.edit_attempts >= self.task.budget.max_edit_attempts:
@@ -369,6 +409,9 @@ class AgentLoop:
             return "search round budget exhausted"
         if name == "list_symbols" and usage.symbol_expansions >= self.task.budget.max_symbol_expansions:
             return "symbol expansion budget exhausted"
+        if name == "run_checks" and usage.check_runs + requested_check_runs > self.task.budget.max_check_runs:
+            # all-or-nothing: a multi-name call with budget for fewer runs nothing
+            return "check run budget exhausted"
         if name in {"search_code", "list_symbols"} and len(self.executor.workspace.observed_hashes) >= self.task.budget.max_context_files:
             # 近似口径:context_files 的精确计数是 observations 去重证据文件数
             # (事后统计),执行前只能用已观察文件数(observed_hashes,含 warning
@@ -379,6 +422,8 @@ class AgentLoop:
         return None
 
     def _chunk_budget_error(self, usage: AgentUsage, action: Any = None) -> str | None:
+        # run_checks 的 check-runs 预算门在此刻意缺席(设计 §1.7 站点 6):BoundaryDetector
+        # 会先以 non-read-only 拒绝任何包含 run_checks 的 chunk(chunking.py),该门不可达。
         if usage.tool_calls >= self.task.budget.max_tool_calls:
             return "tool call budget exhausted during action chunk"
         name = str(getattr(action, "tool", ""))
@@ -503,6 +548,13 @@ class AgentLoop:
                 if action == ActionKind.FIX_CANDIDATE:
                     action_map[identifier] = ActionKind.REVIEW_REQUIRED
         unresolved = tuple(identifier for identifier, action in action_map.items() if action in {ActionKind.UNRESOLVED, ActionKind.REVIEW_REQUIRED})
+        review_notes = (
+            "Proposal only; it is not a frozen or verified candidate.",
+            f"Patch scope: {scope.changed_files} files, {scope.diff_lines} changed lines ({scope.added_lines} added, {scope.deleted_lines} deleted).",
+        )
+        check_note = _check_summary_note(observations)
+        if check_note:
+            review_notes = (*review_notes, check_note)
         return BatchProposal(
             batch_id=batch_id,
             worker_id=self.worker_id,
@@ -515,5 +567,5 @@ class AgentLoop:
             risk=max((getattr(issue, "risk", RiskClass.UNKNOWN) for issue in issues), key=lambda item: {RiskClass.UNKNOWN: 0, RiskClass.LOW: 1, RiskClass.MEDIUM: 2, RiskClass.HIGH: 3}[item]),
             unresolved=unresolved,
             complete=not unresolved,
-            review_notes=("Proposal only; it is not a frozen or verified candidate.", f"Patch scope: {scope.changed_files} files, {scope.diff_lines} changed lines ({scope.added_lines} added, {scope.deleted_lines} deleted)."),
+            review_notes=review_notes,
         )

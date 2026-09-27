@@ -199,7 +199,7 @@ class RunStore:
     def update_worker_budget(self, run_id: str, worker_id: str, usage: Mapping[str, Any]) -> dict[str, int | float | bool]:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", worker_id):
             raise StoreError("worker usage key is invalid")
-        fields = ("model_calls", "model_attempts", "model_retries", "tool_calls", "tokens", "edit_attempts", "chunk_actions", "changed_files", "diff_lines", "search_rounds", "symbol_expansions", "context_files")
+        fields = ("model_calls", "model_attempts", "model_retries", "tool_calls", "tokens", "edit_attempts", "chunk_actions", "changed_files", "diff_lines", "search_rounds", "symbol_expansions", "context_files", "check_runs")
         snapshot: dict[str, int | float | bool] = {key: max(0, int(usage.get(key, 0))) for key in fields}
         snapshot["elapsed_seconds"] = max(0.0, float(usage.get("elapsed_seconds", 0.0)))
         snapshot["token_usage_known"] = bool(usage.get("token_usage_known", True))

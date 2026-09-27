@@ -8,13 +8,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from ..config import ToolLimits
+from ..config import CheckSpec, ToolLimits
 from ..context import ContextCache
 from ..domain import Observation, ToolStatus, canonical_json
 from ..memory import EpisodeStore
 from ..models import ToolCall
 from ..runtime.workspace import WorkspaceState
 from ..skills import SkillStore
+from .checks import CheckTools
 from .edit import EditTool
 from .source import SearchRankingContext, SourceTools
 
@@ -86,6 +87,8 @@ class ToolExecutor:
         cache: ContextCache | None = None,
         ranking_context: "SearchRankingContext | None" = None,
         search_backend: str = "auto",
+        check_specs: tuple[CheckSpec, ...] = (),
+        check_command_prefix: tuple[str, ...] = (),
     ) -> None:
         self.workspace = workspace
         self.limits = limits or ToolLimits()
@@ -106,6 +109,8 @@ class ToolExecutor:
         self._register(ToolSpec("git_diff", "Read the actual Git working-tree diff.", True), source.git_diff)
         self._register(ToolSpec("read_guideline", "Read a versioned Skill guideline.", True, ("skill_id",), True, {"skill_id": {"type": "string"}}), self._read_guideline)
         self._register(ToolSpec("memory_retrieve", "Retrieve historical repair episodes with lexical confidence checks against the current workspace; results are provenance-bound and ranked by structured scoring.", True, (), False, {"repo": {"type": "string"}, "module": {"type": "string"}, "rule": {"type": "string"}, "keywords": {"type": "array", "items": {"type": "string"}}, "symbol": {"type": "string"}, "source_commit": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}), self._memory_retrieve)
+        # registered unconditionally so the schema is stable across configurations (tech-design §1.3)
+        self._register(ToolSpec("run_checks", "Run configured trusted checks by name; the verdict comes from the exit code only. Checks are configuration data; they cannot be defined or redefined from here.", False, ("names",), False, {"names": {"type": "array", "items": {"type": "string"}}}), CheckTools(workspace, check_specs, check_command_prefix, self.limits).run_checks)
 
     def _register(self, spec: ToolSpec, handler: Handler) -> None:
         self.registry.register(spec)
