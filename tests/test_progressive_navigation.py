@@ -116,6 +116,25 @@ class SymbolScannerTests(unittest.TestCase):
         names = [item.name for item in scan_symbols(text)]
         self.assertEqual(names, ["use"])
 
+    def test_enum_declarations_are_recognized(self) -> None:
+        text = (
+            "enum color { RED, GREEN };\n"
+            "enum class Mode { ON, OFF };\n"
+            "enum struct State { IDLE };\n"
+            "enum legacy : unsigned char { LOW };\n"
+            "int pick(enum color c) { return c; }\n"
+        )
+        names = [item.name for item in scan_symbols(text)]
+        # C 风格 enum 与 enum class/enum struct 都要产出声明;枚举常量不是符号。
+        self.assertEqual(names, ["color", "Mode", "State", "legacy", "pick"])
+        decls = {item.name: item for item in scan_symbols(text)}
+        self.assertEqual(decls["color"].type, "enum")
+        self.assertEqual((decls["color"].start_line, decls["color"].end_line), (1, 1))
+        self.assertEqual(decls["Mode"].type, "enum")
+        self.assertEqual(decls["State"].type, "enum")
+        self.assertEqual(decls["legacy"].type, "enum")
+        self.assertEqual(decls["pick"].type, "function")
+
     def test_symbol_decl_is_frozen(self) -> None:
         decl = SymbolDecl("function", "f", "void f()", 1, 1)
         with self.assertRaises(Exception):
@@ -327,6 +346,24 @@ class SearchBackendTests(unittest.TestCase):
         self.assertEqual(result.content["total_hits"], 5)
         self.assertEqual(len(result.content["files"][0]["sample_lines"]), 3)
         self.assertEqual([item["line"] for item in result.content["files"][0]["sample_lines"]], [1, 2, 3])
+
+    def test_direct_handler_invalid_max_results_is_bounded_error(self) -> None:
+        # ToolExecutor 路径由 schema 校验 integer>=1;直接 handler 调用传非法
+        # max_results 必须返回有界 ERROR,而不是抛 ValueError/TypeError。
+        workspace = WorkspaceState(self.repo, self.base)
+        tools = source_module.SourceTools(workspace, max_file_bytes=256_000, max_output_chars=80_000, max_search_results=200, search_backend="python")
+        for bad in ("abc", None, [], {}):
+            with self.subTest(bad=bad):
+                status, content, touched, hashes, complete, error = tools.search_code({"query": "OLD", "max_results": bad})
+                self.assertEqual(status, ToolStatus.ERROR)
+                self.assertIsNone(content)
+                self.assertEqual(touched, ())
+                self.assertFalse(complete)
+                self.assertEqual(error, "invalid argument: max_results")
+        # 对照:合法 max_results 的直接调用仍按 cap 正常有界返回。
+        status, content, touched, hashes, complete, error = tools.search_code({"query": "OLD", "max_results": 1})
+        self.assertEqual(status, ToolStatus.PARTIAL)
+        self.assertEqual(content["total_hits"], 1)
 
 
 class SearchRankingTests(unittest.TestCase):

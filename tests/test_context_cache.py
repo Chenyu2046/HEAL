@@ -13,10 +13,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import repair_agent.tools.source as source_module
+from repair_agent.agent import AgentLoop
 from repair_agent.config import Config, ToolLimits, load_config
 from repair_agent.context import ContextCache, FileContextCache, SearchContextEntry, SearchResultCache
-from repair_agent.domain import ToolStatus
-from repair_agent.models import ToolCall
+from repair_agent.domain import Budget, Finding, RepairTask, Severity, ToolStatus
+from repair_agent.models import ScriptedModel, ToolCall
 from repair_agent.runtime.workspace import WorkspaceState
 from repair_agent.tools.executor import ToolExecutor
 
@@ -311,6 +312,95 @@ class ContextCacheTests(unittest.TestCase):
         self.assertEqual(len(searches), 1)
         self.assertIsNone(searches.get("q1", (".",), 5, {}))
         self.assertIsNotNone(searches.get("q2", (".",), 5, {}))
+
+
+class ContextCacheAgentLoopTests(unittest.TestCase):
+    """缓存开启的全链路防回归(Phase 1 终审遗留)。
+
+    ToolExecutor 注入 ContextCache 等价于生产 context_cache_enabled=True 的
+    注入路径;ScriptedModel 决策序列驱动 AgentLoop 跑通 read/search/
+    list_symbols + edit_file,断言:缓存回放 Observation 与直接读同构
+    (status/content/hashes)、edit 后缓存失效读到新内容、全程无需人工复核。
+    """
+
+    A_C = b"int first = OLD;\nint second = OLD;\nvoid run_step(void) {\n    step(OLD);\n}\n"
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repo = Path(temporary.name) / "repo"
+        repo.mkdir()
+        git(repo, "init", "--quiet")
+        git(repo, "config", "user.name", "HEAL test")
+        git(repo, "config", "user.email", "heal-test@localhost")
+        git(repo, "config", "core.autocrlf", "false")
+        (repo / "src").mkdir()
+        (repo / "src" / "a.c").write_bytes(self.A_C)
+        git(repo, "add", "--all")
+        git(repo, "commit", "-m", "base", "--quiet")
+        self.repo = repo
+        self.base = git(repo, "rev-parse", "HEAD")
+
+    def test_cache_on_loop_replays_isomorphic_reads_and_invalidates_after_edit(self) -> None:
+        path = "src/a.c"
+        decisions = [
+            {"kind": "tool_call", "tool_call": {"name": "read_file", "arguments": {"path": path}}},
+            {"kind": "tool_call", "tool_call": {"name": "read_file", "arguments": {"path": path}}},
+            {"kind": "tool_call", "tool_call": {"name": "search_code", "arguments": {"query": "OLD"}}},
+            {"kind": "tool_call", "tool_call": {"name": "search_code", "arguments": {"query": "OLD"}}},
+            {"kind": "tool_call", "tool_call": {"name": "list_symbols", "arguments": {"path": path}}},
+            {"kind": "tool_call", "tool_call": {"name": "list_symbols", "arguments": {"path": path}}},
+            {"kind": "tool_call", "tool_call": {"name": "edit_file", "arguments": {
+                "path": path,
+                "expected_hash": hashlib.sha256(self.A_C).hexdigest(),
+                "old_text": "int first = OLD;",
+                "new_text": "int first = NEW;",
+            }}},
+            {"kind": "tool_call", "tool_call": {"name": "read_file", "arguments": {"path": path}}},
+            {"kind": "tool_call", "tool_call": {"name": "search_code", "arguments": {"query": "OLD"}}},
+            {"kind": "tool_call", "tool_call": {"name": "list_symbols", "arguments": {"path": path}}},
+            {"kind": "batch_ready", "action_map": {"finding-1": "FIX_CANDIDATE"}},
+        ]
+        cache = ContextCache()
+        executor = ToolExecutor(WorkspaceState(self.repo, self.base), cache=cache, search_backend="python")
+        task = RepairTask(
+            "task", "run", str(self.repo), self.base,
+            (Finding("finding-1", "R001", Severity.LOW, path, 1, "replace old value"),),
+            budget=Budget(),
+        )
+        result = AgentLoop(task, worker_id="worker", model=ScriptedModel(decisions), executor=executor).run("batch", task.issues)
+
+        # 全程无需人工复核:所有观察 complete 且无阻塞状态,提案正常产出。
+        self.assertFalse(result.review_required, msg=str(result.reason))
+        self.assertIsNotNone(result.proposal)
+        self.assertEqual(result.proposal.changed_files, (path,))
+
+        observations = result.observations
+        # 每对 (直接读, 缓存回放) 同构:status/content/hashes/complete 一致。
+        for direct, replayed in ((observations[0], observations[1]), (observations[2], observations[3]), (observations[4], observations[5])):
+            self.assertEqual(
+                (replayed.status, replayed.content, replayed.file_hashes, replayed.complete),
+                (direct.status, direct.content, direct.file_hashes, direct.complete),
+            )
+            self.assertEqual(replayed.status, ToolStatus.OK)
+
+        # edit 成功;edit 后按路径校验自然失效:读到新内容、新 hash。
+        self.assertEqual(observations[6].status, ToolStatus.OK)
+        self.assertIn("int first = NEW;", observations[7].content["text"])
+        self.assertNotIn("int first = OLD;\n", observations[7].content["text"])
+        self.assertNotEqual(observations[7].content["content_hash"], observations[0].content["content_hash"])
+        self.assertEqual(observations[7].file_hashes, {path: observations[7].content["content_hash"]})
+        # 搜索重扫反映编辑后的现实:OLD 只剩 line 2 与 line 4 两处命中。
+        self.assertEqual(observations[8].status, ToolStatus.OK)
+        self.assertEqual(observations[8].content["total_hits"], 2)
+        # 符号重扫仍可用(缓存失效后走物理读取)。
+        self.assertEqual(observations[9].status, ToolStatus.OK)
+
+        # 回放确实来自缓存:三个区各有逻辑命中,而不是全靠重扫。
+        stats = cache.stats()
+        self.assertGreaterEqual(stats["file_hits"], 1)
+        self.assertGreaterEqual(stats["search_hits"], 1)
+        self.assertGreaterEqual(stats["symbol_hits"], 1)
 
 
 if __name__ == "__main__":

@@ -102,6 +102,20 @@ class Episode:
     confidence: str = ""
     schema_version: str = "1"
 
+    def __post_init__(self) -> None:
+        # canonical_json 把 tuple 字段写成 JSON 数组,Episode(**json) 读回会是
+        # list,与 frozen 注解不符;这里把序列字段统一 tuple 化,保证
+        # round-trip 与旧扁平 JSON 读回类型稳定。list 之外的非 tuple 入参在
+        # 此 fail-closed(retrieve 的加载路径会捕获并跳过该条)。
+        for name in ("keywords", "provenance", "changed_files"):
+            value = getattr(self, name)
+            if isinstance(value, tuple):
+                continue
+            if isinstance(value, list):
+                object.__setattr__(self, name, tuple(value))
+                continue
+            raise TypeError(f"Episode.{name} must be a tuple or list, got {type(value).__name__}")
+
 
 class EpisodeStore:
     """JSON episode files keep the initial store inspectable and dependency-free."""
@@ -234,6 +248,9 @@ def _probe_symbol_confidence(workspace: "WorkspaceState", *, file: str | None, s
     STALE = 文件不存在(含受保护/逃逸路径)或扫描结果中符号已消失;
     MEDIUM = 无 file/symbol、文件超限、读取失败或扫描不到任何声明——扫描器
     对宏/typedef 有漏报天花板,此时诚实地说"无法判断"而不是猜 HIGH/STALE。
+    与方案 §14 的偏差声明:§14 定义四档 HIGH/MEDIUM/LOW/STALE,本实现三档——
+    LOW 并入 STALE,MEDIUM 重定义为"扫描器无法判断",整体方向更保守(fail-closed:
+    不确定时不给 HIGH)。
     """
     if not file or not symbol:
         return "MEDIUM"

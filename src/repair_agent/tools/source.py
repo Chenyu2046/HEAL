@@ -220,10 +220,11 @@ class SourceTools:
         return ToolStatus.OK, content, (relative,), hashes, True, None
 
     def _effective_max_results(self, arguments: dict[str, Any]) -> int | None:
-        """Mirror of the in-loop limit expression; do not change one side alone.
+        """Single source of truth for the search cap: cache key 的 limit 与收集期 cap 同源。
 
         ToolExecutor 路径已由 schema 校验为 integer>=1,except 分支只兜住直接
-        handler 调用的非法参数;返回 None 表示该次调用不读写缓存。
+        handler 调用的非法参数:返回 None,search_code 据此返回有界 ERROR,
+        不抛异常也不猜默认值。
         """
         raw = arguments.get("max_results", self.max_search_results)
         try:
@@ -248,8 +249,15 @@ class SourceTools:
         deadline = float(arguments["_deadline"]) if arguments.get("_deadline") is not None else None
         raw_paths = arguments.get("paths") or ["."]
         scope = tuple(str(item) for item in raw_paths)
-        cap = min(self.max_search_results, int(arguments.get("max_results", self.max_search_results)))
-        limit = self._effective_max_results(arguments) if self.cache is not None else None
+        cap = self._effective_max_results(arguments)
+        if cap is None:
+            # 直接 handler 调用的非法 max_results:有界 ERROR,fail-closed
+            # (ToolExecutor 路径已由 schema 校验挡掉,不会走到这里)。
+            return ToolStatus.ERROR, None, (), {}, False, "invalid argument: max_results"
+        # 已知权衡:cap 在收集期先到先得生效(按扫描顺序),排序(_score_file)只作用于
+        # 已收集命中——遍历序靠后的高相关文件可能整体缺席。升级路径:先做文件级计数
+        # 再取样,或 rg 侧用 --max-count 按文件限量(方案 §7)。
+        limit = cap if self.cache is not None else None
         if limit is not None:
             hit = self.cache.searches.get(query, scope, limit, self.workspace.observed_hashes)
             if hit is not None:

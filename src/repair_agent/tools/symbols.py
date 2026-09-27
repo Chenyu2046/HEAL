@@ -22,7 +22,7 @@ SIGNATURE_MAX_CHARS = 160
 # list_symbols 输出条数上限;工具层据此对超限结果给出 TRUNCATED(扫描器本身不截断)。
 MAX_SYMBOL_DECLS = 512
 
-_TYPE_KEYWORDS = frozenset({"namespace", "class", "struct"})
+_TYPE_KEYWORDS = frozenset({"namespace", "class", "struct", "enum"})
 _CONTROL_KEYWORDS = frozenset({
     "if", "for", "while", "switch", "catch", "return", "goto", "throw",
     "sizeof", "alignof", "alignas", "decltype", "new", "delete", "static_assert", "co_await", "co_return", "co_yield",
@@ -194,16 +194,6 @@ def _find_body_open(cleaned: str, start: int, end: int, *, max_chars: int, max_n
     return -1
 
 
-def _prev_word(cleaned: str, pos: int) -> str:
-    i = pos - 1
-    while i >= 0 and cleaned[i].isspace():
-        i -= 1
-    e = i
-    while i >= 0 and (cleaned[i].isalnum() or cleaned[i] == "_"):
-        i -= 1
-    return cleaned[i + 1 : e + 1]
-
-
 def _qualified_name_backward(cleaned: str, ident_start: int, ident: str) -> str:
     """Collect ``Class::method`` / ``~Class`` prefixes written before the identifier.
 
@@ -252,9 +242,18 @@ def _line_of(line_starts: tuple[int, ...], offset: int) -> int:
 
 
 def _try_type_decl(cleaned: str, kw_start: int, keyword: str, end: int, line_starts: tuple[int, ...]):
-    """Match ``namespace/class/struct Name[: bases] {``; forward declarations return None."""
-    kind = "enum" if _prev_word(cleaned, kw_start) == "enum" else keyword
+    """Match ``namespace/class/struct/enum Name[: bases] {``; forward declarations return None.
+
+    enum 的三种形态在此正向区分:``enum Name`` / ``enum class Name`` / ``enum struct
+    Name``——枚举名前的 class/struct 是声明的一部分,消费掉;kind 统一记为 "enum"
+    (与既有 ``enum class`` 识别口径一致)。
+    """
+    kind = keyword
     j = _skip_ws(cleaned, kw_start + len(keyword), end)
+    if keyword == "enum":
+        m = _IDENT_RE.match(cleaned, j)
+        if m is not None and m.group(0) in {"class", "struct"}:
+            j = _skip_ws(cleaned, m.end(), end)
     # Skip attributes [[...]] and alignas(...) noise before the name.
     for _ in range(4):
         if cleaned.startswith("[[", j):

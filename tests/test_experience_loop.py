@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from repair_agent.adapters.ci import CIRequest
 from repair_agent.adapters.gerrit import SubmissionResponse
 from repair_agent.config import Config
-from repair_agent.domain import ActionKind, Stage, SubmissionStatus, ValidationClass
+from repair_agent.domain import ActionKind, Stage, SubmissionStatus, ValidationClass, canonical_json
 from repair_agent.experience import ExperienceWriter
 from repair_agent.memory import Episode, EpisodeStore
 from repair_agent.models import ScriptedModel
@@ -146,6 +146,32 @@ class StructuredScoringTests(unittest.TestCase):
         self.assertEqual(episode.confidence, "")
         self.assertEqual(episode.trigger_symbol, "")
         self.assertEqual(episode.schema_version, "1")
+
+    def test_episode_round_trip_keeps_sequence_fields_as_tuples(self) -> None:
+        # canonical_json 把 tuple 写成 JSON 数组;Episode(**json) 读回必须仍是
+        # 注解声明的 tuple,而不是 list。
+        episode = self.episode("round-trip", changed_files=("src/a.c", "src/b.c"))
+        restored = Episode(**json.loads(canonical_json(episode)))
+        self.assertEqual(restored, episode)
+        self.assertIsInstance(restored.keywords, tuple)
+        self.assertIsInstance(restored.provenance, tuple)
+        self.assertIsInstance(restored.changed_files, tuple)
+        self.assertEqual(restored.keywords, ("null",))
+        self.assertEqual(restored.provenance, ("p",))
+        self.assertEqual(restored.changed_files, ("src/a.c", "src/b.c"))
+
+    def test_legacy_flat_json_sequence_fields_read_back_as_tuples(self) -> None:
+        # 旧扁平 JSON 的序列字段是 list;读回应 tuple 化,保持类型稳定。
+        legacy = {
+            "episode_id": "legacy-flat", "repo": "repo", "module": "src", "rule": "R001",
+            "source_commit": "c1", "memory_type": "fix", "keywords": ["null"], "summary": "s",
+            "provenance": ["p"], "human_review": "APPROVED", "ci_result": "VALIDATION_PASS",
+        }
+        restored = Episode(**legacy)
+        self.assertIsInstance(restored.keywords, tuple)
+        self.assertIsInstance(restored.provenance, tuple)
+        self.assertEqual(restored.keywords, ("null",))
+        self.assertEqual(restored.provenance, ("p",))
 
     def test_confidence_three_tiers_and_score_bonus(self) -> None:
         temporary = tempfile.TemporaryDirectory()

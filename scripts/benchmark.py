@@ -368,7 +368,9 @@ def build_recall_fixture(root: Path) -> Path:
     for relative, content in _RECALL_FILES.items():
         target = repo / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        # 与 build_context_fixture 同一确定性纪律:write_bytes 写 LF 字节,
+        # 避免 Windows 文本模式把 \n 翻译成 \r\n 破坏跨平台逐字节一致性。
+        target.write_bytes(content.encode("utf-8"))
     return repo
 
 
