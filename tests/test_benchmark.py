@@ -113,5 +113,42 @@ class RecallBenchmarkTests(unittest.TestCase):
         self.assertIn("packet_send", packet["symbol_candidates"])
 
 
+class DedupBenchmarkTests(unittest.TestCase):
+    """R3-4: dedup comparison harness — estimate decreases, repair outcomes identical."""
+
+    def test_compute_dedup_comparison_is_pure_aggregation(self) -> None:
+        arms = {
+            "dedup_off": {"context_token_estimate_bytes": 1000, "repair_completed": True, "review_required": False, "model_calls": 9},
+            "dedup_on": {"context_token_estimate_bytes": 800, "repair_completed": True, "review_required": False, "model_calls": 9},
+        }
+        comparison = benchmark.compute_dedup_comparison(arms)
+        self.assertEqual(comparison["estimate_off"], 1000)
+        self.assertEqual(comparison["estimate_on"], 800)
+        self.assertTrue(comparison["estimate_decreases"])
+        self.assertTrue(comparison["repair_outcomes_identical"])
+        self.assertTrue(comparison["model_calls_equal"])
+        worse = benchmark.compute_dedup_comparison({
+            "dedup_off": arms["dedup_off"],
+            "dedup_on": {**arms["dedup_on"], "context_token_estimate_bytes": 1200},
+        })
+        self.assertFalse(worse["estimate_decreases"])
+
+    def test_dedup_arms_decrease_estimate_with_identical_outcomes(self) -> None:
+        report = benchmark.build_dedup_report()
+        self.assertEqual(report["benchmark"], "dedup")
+        self.assertIn("context_token_estimate_basis", report["metric_definitions"])
+        self.assertIn("notCovered", report["scope"])
+        arms = report["runs"]
+        self.assertEqual(set(arms), {"dedup_off", "dedup_on"})
+        self.assertFalse(arms["dedup_off"]["dedup_enabled"])
+        self.assertTrue(arms["dedup_on"]["dedup_enabled"])
+        comparison = report["comparison"]
+        self.assertTrue(comparison["estimate_decreases"], msg=str(comparison))
+        self.assertTrue(comparison["repair_outcomes_identical"])
+        self.assertTrue(comparison["model_calls_equal"])
+        self.assertTrue(arms["dedup_off"]["repair_completed"])
+        self.assertTrue(arms["dedup_on"]["repair_completed"])
+
+
 if __name__ == "__main__":
     unittest.main()

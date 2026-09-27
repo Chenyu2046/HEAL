@@ -78,6 +78,8 @@ class Config:
     max_skill_scan_bytes: int = 512_000
     checks: tuple[CheckSpec, ...] = ()          # empty ⇒ run_checks tool is UNSUPPORTED
     check_command_prefix: tuple[str, ...] = ()  # optional trusted prefix (tech-design §1.6)
+    evidence_ledger_enabled: bool = True        # R2 rollback switch (tech-design §2.1)
+    dedup_observations_enabled: bool = False    # R3 switch; changes prompt semantics, default off (§2.6)
 
     def __post_init__(self) -> None:
         if self.mode not in {"local-demo", "simulated-enterprise", "enterprise"}:
@@ -183,4 +185,6 @@ def load_config(path: str | Path | None = None) -> Config:
         max_skill_scan_bytes=int(raw.get("max_skill_scan_bytes", 512_000)),
         checks=check_specs,
         check_command_prefix=check_prefix,
+        evidence_ledger_enabled=bool(raw.get("evidence_ledger_enabled", True)),
+        dedup_observations_enabled=bool(raw.get("dedup_observations_enabled", False)),
     )

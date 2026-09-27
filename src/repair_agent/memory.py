@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
 
-from .domain import ActionKind, Observation, RiskClass, canonical_json, sha256_text, utc_now
+from .domain import ActionKind, Observation, RiskClass, ToolStatus, canonical_json, redact_text, sha256_text, utc_now
 from .runtime.workspace import WorkspaceError
 
 if TYPE_CHECKING:  # 仅类型标注;运行时不需要,避免引入更重的依赖面
@@ -23,6 +23,8 @@ _EPISODE_PROBE_MAX_BYTES = 256_000
 
 @dataclass
 class TaskStateMemory:
+    """Deprecated: superseded by :class:`EvidenceLedger` (tech-design §2.2); kept for import compatibility."""
+
     task_id: str
     worker_id: str
     current_hypothesis: str = ""
@@ -34,6 +36,143 @@ class TaskStateMemory:
         self.observations.append(observation)
         if observation.error:
             self.evidence.append(observation.error)
+
+
+# --- EvidenceLedger (R2, tech-design §2.2):bounded deterministic evidence, never model claims ---
+
+MAX_LEDGER_FILES = 50          # mirrors the 50-path cap of historical_summary (agent.py)
+MAX_LEDGER_ATTEMPTS = 8        # mirrors the 8-entry cap of pinned_evidence (agent.py)
+MAX_HYPOTHESIS_CHARS = 1_000
+MAX_ATTEMPT_SUMMARY_CHARS = 1_000
+MAX_NEXT_QUESTIONS = 5
+MAX_QUESTION_CHARS = 300
+_TRUNCATION_MARKER = "…[truncated]"
+
+# 与 AgentLoop._record 的阻断集合一致:失败编辑进入 failed_attempts。
+_BLOCKING_STATUSES = frozenset({
+    ToolStatus.ERROR, ToolStatus.PARTIAL, ToolStatus.TRUNCATED, ToolStatus.VERSION_CHANGED,
+    ToolStatus.AMBIGUOUS, ToolStatus.UNSUPPORTED, ToolStatus.NOT_EXECUTED,
+})
+
+
+def _cap_text(value: str, cap: int) -> str:
+    if len(value) <= cap:
+        return value
+    return value[:cap] + _TRUNCATION_MARKER
+
+
+@dataclass(frozen=True)
+class FileEvidence:
+    path: str            # workspace-relative, normalized
+    last_hash: str       # last observed content hash; "" when the observation carried no hash
+    last_tool: str       # tool of the last observation touching the file
+    last_revision: int   # workspace_revision of that observation
+
+
+@dataclass(frozen=True)
+class CheckRecord:
+    name: str
+    last_verdict: str            # PASS | FAIL | INFRA_FAIL
+    runs: int
+    last_returncode: int | None  # exit code of the last run; None for INFRA_FAIL
+    last_error: str              # redacted, bounded; "" when none
+
+
+@dataclass(frozen=True)
+class AttemptRecord:
+    tool_call_id: str
+    path: str
+    status: str              # ToolStatus value of the failed edit
+    error: str               # redact_text-ed, bounded
+
+
+@dataclass
+class EvidenceLedger:
+    """Deterministic per-worker evidence derived only from observations and bounded model fields."""
+
+    task_id: str
+    worker_id: str
+    file_evidence: dict[str, FileEvidence] = field(default_factory=dict)   # insertion-ordered
+    checks: dict[str, CheckRecord] = field(default_factory=dict)           # insertion-ordered
+    failed_attempts: tuple[AttemptRecord, ...] = ()
+    hypothesis: str = ""
+    next_questions: tuple[str, ...] = ()
+    attempt_summary: str = ""
+
+    def record(self, observation: Observation) -> None:
+        """The only observation-driven mutation entry point (tech-design §2.2 rules 1-4)."""
+        for path in dict.fromkeys((*observation.source_paths, *observation.file_hashes.keys())):
+            # 上 upsert 不改变首见位置:Python dict 对已有键赋值保持原插入序。
+            self.file_evidence[path] = FileEvidence(
+                path=path,
+                last_hash=observation.file_hashes.get(path, ""),
+                last_tool=observation.tool,
+                last_revision=observation.workspace_revision,
+            )
+        while len(self.file_evidence) > MAX_LEDGER_FILES:
+            self.file_evidence.pop(next(iter(self.file_evidence)))
+        if observation.tool == "run_checks" and isinstance(observation.content, Mapping):
+            entries = observation.content.get("checks")
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, Mapping) or not entry.get("name"):
+                        continue
+                    name = str(entry["name"])
+                    existing = self.checks.get(name)
+                    returncode = entry.get("returncode")
+                    self.checks[name] = CheckRecord(
+                        name=name,
+                        last_verdict=str(entry.get("verdict", "")),
+                        runs=(existing.runs if existing is not None else 0) + 1,
+                        last_returncode=returncode if isinstance(returncode, int) else None,
+                        last_error=_cap_text(redact_text(str(entry.get("error") or "")), MAX_QUESTION_CHARS),
+                    )
+        if observation.tool == "edit_file" and (not observation.complete or observation.status in _BLOCKING_STATUSES):
+            attempt = AttemptRecord(
+                tool_call_id=observation.tool_call_id,
+                path=observation.source_paths[0] if observation.source_paths else "",
+                status=observation.status.value,
+                error=_cap_text(redact_text(str(observation.error or "")), MAX_QUESTION_CHARS),
+            )
+            self.failed_attempts = (*self.failed_attempts, attempt)[-MAX_LEDGER_ATTEMPTS:]
+
+    def set_model_fields(self, hypothesis: Any, next_questions: Any, attempt_summary: Any) -> None:
+        """Ingest batch_ready model claims with redaction and bounds; the only model-write entry point."""
+        self.hypothesis = _cap_text(redact_text(hypothesis), MAX_HYPOTHESIS_CHARS) if isinstance(hypothesis, str) else ""
+        self.attempt_summary = _cap_text(redact_text(attempt_summary), MAX_ATTEMPT_SUMMARY_CHARS) if isinstance(attempt_summary, str) else ""
+        questions: list[str] = []
+        if isinstance(next_questions, (list, tuple)):
+            for item in list(next_questions)[:MAX_NEXT_QUESTIONS]:
+                questions.append(_cap_text(redact_text(item if isinstance(item, str) else str(item)), MAX_QUESTION_CHARS))
+        self.next_questions = tuple(questions)
+
+    def to_payload(self) -> dict[str, Any]:
+        """Deterministic, frame-free payload; task_id/worker_id are excluded by design (§2.2)."""
+        return {
+            "file_evidence": {
+                path: {"last_hash": item.last_hash, "last_tool": item.last_tool, "last_revision": item.last_revision}
+                for path, item in sorted(self.file_evidence.items())
+            },
+            "checks": {
+                name: {"last_verdict": item.last_verdict, "runs": item.runs, "last_returncode": item.last_returncode, "last_error": item.last_error}
+                for name, item in sorted(self.checks.items())
+            },
+            "failed_attempts": [
+                {"tool_call_id": item.tool_call_id, "path": item.path, "status": item.status, "error": item.error}
+                for item in self.failed_attempts
+            ],
+            "hypothesis": self.hypothesis,
+            "next_questions": list(self.next_questions),
+            "attempt_summary": self.attempt_summary,
+        }
+
+
+def build_ledger(task_id: str, worker_id: str, observations: Any) -> EvidenceLedger:
+    """Rebuild a ledger by replaying an observation sequence in order."""
+    ledger = EvidenceLedger(task_id=task_id, worker_id=worker_id)
+    for observation in observations:
+        ledger.record(observation)
+    return ledger
 
 
 @dataclass(frozen=True)

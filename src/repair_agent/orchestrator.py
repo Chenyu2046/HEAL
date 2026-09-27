@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 import time
 from functools import wraps
@@ -136,12 +137,14 @@ class RepairOrchestrator:
         self.local_validator = LocalValidator(self.validator)
         self.report_writer = ReportWriter()
 
-    def run(self, payload: Mapping[str, Any], *, cli_budget_overrides: Mapping[str, Any] | None = None) -> WorkflowResult:
+    def run(self, payload: Mapping[str, Any], *, cli_budget_overrides: Mapping[str, Any] | None = None, replan_of_run_id: str | None = None) -> WorkflowResult:
+        if replan_of_run_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", replan_of_run_id):
+            raise OrchestratorError("replan_of_run_id must be a safe run id")
         normalized = self.normalizer.normalize(payload, default_repo=self.config.source_repo, default_budget=self.config.budget, default_mode=self.config.mode, default_model_id=self.config.model.model_id, cli_budget_overrides=cli_budget_overrides)
         with self.store.lifecycle_guard(normalized.task.run_id):
-            return self._run_normalized(normalized)
+            return self._run_normalized(normalized, replan_of_run_id=replan_of_run_id)
 
-    def _run_normalized(self, normalized) -> WorkflowResult:
+    def _run_normalized(self, normalized, *, replan_of_run_id: str | None = None) -> WorkflowResult:
         task = normalized.task
         workflow_started_at = time.monotonic()
         manager = GitWorktreeManager(self.config.workspace_parent)
@@ -154,6 +157,24 @@ class RepairOrchestrator:
             return self._finish_review(task.run_id, (f"NOT_CONFIGURED/WORKSPACE: {exc}",))
         task = replace(task, base_commit=resolved_base, issues=tuple(replace(issue, base_commit=resolved_base) for issue in task.issues))
         record = RunRecord(task.run_id, task.task_id, Stage.RECEIVED, self.config.version, task.model_id, {})
+        # R2 重规划注入:一次性加载,marker 与 ledger 捆绑在 create_run 时持久化(§2.4)。
+        prior_ledger: dict[str, Any] | None = None
+        prior_marker: dict[str, Any] = {"prior_ledger_loaded": False, "prior_ledger_reason": "not_provided"}
+        if replan_of_run_id is not None:
+            if self.store.get_run(replan_of_run_id) is None:
+                prior_marker = {"prior_ledger_loaded": False, "prior_ledger_reason": "prior_run_not_found"}
+            else:
+                try:
+                    prior_payload = self.store.latest_worker_ledger(replan_of_run_id)
+                except StoreError:
+                    prior_marker = {"prior_ledger_loaded": False, "prior_ledger_reason": "ledger_unreadable"}
+                else:
+                    if prior_payload is None:
+                        prior_marker = {"prior_ledger_loaded": False, "prior_ledger_reason": "no_worker_checkpoint"}
+                    else:
+                        prior_marker = {"prior_ledger_loaded": True, "prior_ledger_source_run_id": replan_of_run_id}
+                        ledger_value = prior_payload.get("evidence_ledger")
+                        prior_ledger = {"from_run_id": replan_of_run_id, "ledger": ledger_value if isinstance(ledger_value, dict) else {}}
         self.store.create_run(record, {
             "task": to_primitive(task),
             "normalization_warnings": list(normalized.warnings),
@@ -162,6 +183,8 @@ class RepairOrchestrator:
             "worker_budget_usage": {},
             "resolved_source_repo": str(source_repo),
             "resolved_base_commit": resolved_base,
+            **({"replan_of_run_id": replan_of_run_id} if replan_of_run_id is not None else {}),
+            **prior_marker,
         })
         resolved_run = self.store.get_run(task.run_id) or {}
         source_repo = Path(str(resolved_run["resolved_source_repo"]))
@@ -185,7 +208,7 @@ class RepairOrchestrator:
                 slot_budgets = self._allocate_slot_budgets(task.budget, current_run.get("budget_used", {}), slot)
                 envelopes = worker_pool.run(
                     slot,
-                    lambda batch, worker_id: self._run_worker(replace(task, budget=slot_budgets[batch.batch_id]), batch, worker_id, manager, source_repo, worktrees, budget_started_at=workflow_started_at),
+                    lambda batch, worker_id: self._run_worker(replace(task, budget=slot_budgets[batch.batch_id]), batch, worker_id, manager, source_repo, worktrees, budget_started_at=workflow_started_at, prior_ledger=prior_ledger),
                 )
                 for envelope in envelopes:
                     result = envelope.result
@@ -240,7 +263,7 @@ class RepairOrchestrator:
             current_budget = (self.store.get_run(task.run_id) or {}).get("budget_used", {})
             replan_budget = self._allocate_slot_budgets(task.budget, current_budget, (replan_batch,))[replan_batch.batch_id]
             try:
-                replan_result = self._run_worker(replace(task, budget=replan_budget), replan_batch, "integration-replan-1", manager, source_repo, worktrees, budget_started_at=workflow_started_at)
+                replan_result = self._run_worker(replace(task, budget=replan_budget), replan_batch, "integration-replan-1", manager, source_repo, worktrees, budget_started_at=workflow_started_at, prior_ledger=prior_ledger)
             except Exception as exc:
                 return self._finish_review(task.run_id, (f"integration re-plan worker failed: {type(exc).__name__}",))
             if replan_result.proposal is None or replan_result.review_required:
@@ -313,7 +336,7 @@ class RepairOrchestrator:
         )
         return batch, tuple(proposal for proposal in proposals if proposal.batch_id not in selected_ids)
 
-    def _run_worker(self, task: RepairTask, batch: WorkingBatch, worker_id: str, manager: GitWorktreeManager, source_repo: Path, worktrees: dict[str, str], *, budget_started_at: float) -> AgentResult:
+    def _run_worker(self, task: RepairTask, batch: WorkingBatch, worker_id: str, manager: GitWorktreeManager, source_repo: Path, worktrees: dict[str, str], *, budget_started_at: float, prior_ledger: Mapping[str, Any] | None = None) -> AgentResult:
         handle = manager.create(task_id=f"{task.run_id}-{batch.batch_id}", source_repo=source_repo, base_commit=task.base_commit, run_id=task.run_id, role="worker")
         worktrees[batch.batch_id] = str(handle.path)
         try:
@@ -327,11 +350,11 @@ class RepairOrchestrator:
             executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store, cache=cache, ranking_context=SearchRankingContext.from_issues(batch.issues), check_specs=self.config.checks, check_command_prefix=self.config.check_command_prefix)
             router = SkillRouter(skill_store)
             model = self.model_factory(task, isolated_worker_id)
-            loop = AgentLoop(task, worker_id=isolated_worker_id, model=model, executor=executor, skill_router=router, chunking_enabled=self.config.chunking_enabled, retry_policy=RetryPolicy(self.config.model.max_retries), tool_limits=self.config.tools, max_recent_observations=self.config.max_recent_observations, max_observation_chars=self.config.max_observation_chars, max_skill_context_chars=self.config.max_skill_context_chars, max_skill_scan_bytes=self.config.max_skill_scan_bytes, trace_callback=lambda observation: self.store.record_trace(task.run_id, {"worker_id": isolated_worker_id, "batch_id": batch.batch_id, "observation": _observation_trace(observation)}), usage_callback=lambda usage: self.store.update_worker_budget(task.run_id, isolated_worker_id, to_primitive(usage)), budget_started_at=budget_started_at)
+            loop = AgentLoop(task, worker_id=isolated_worker_id, model=model, executor=executor, skill_router=router, chunking_enabled=self.config.chunking_enabled, retry_policy=RetryPolicy(self.config.model.max_retries), tool_limits=self.config.tools, max_recent_observations=self.config.max_recent_observations, max_observation_chars=self.config.max_observation_chars, max_skill_context_chars=self.config.max_skill_context_chars, max_skill_scan_bytes=self.config.max_skill_scan_bytes, trace_callback=lambda observation: self.store.record_trace(task.run_id, {"worker_id": isolated_worker_id, "batch_id": batch.batch_id, "observation": _observation_trace(observation)}), usage_callback=lambda usage: self.store.update_worker_budget(task.run_id, isolated_worker_id, to_primitive(usage)), budget_started_at=budget_started_at, evidence_ledger_enabled=self.config.evidence_ledger_enabled, dedup_recent_observations=self.config.dedup_observations_enabled, prior_attempt_evidence=prior_ledger)
             result = loop.run(batch.batch_id, batch.issues)
             self.store.record_trace(task.run_id, {"worker_id": isolated_worker_id, "batch_id": batch.batch_id, "usage": to_primitive(result.usage), "review_required": result.review_required, "reason_present": bool(result.reason)})
             result_artifact = self.store.save_artifact(task.run_id, f"worker-result-{uuid.uuid4().hex}", "worker-result", canonical_json(_worker_result_artifact_payload(result)))
-            self.store.save_checkpoint(task.run_id, f"checkpoint-worker-{uuid.uuid4().hex}", Stage.BATCH_REVIEW, [result_artifact["artifact_id"]], {"batch_id": batch.batch_id, "worker_id": isolated_worker_id, "proposal_present": result.proposal is not None, "review_required": result.review_required})
+            self.store.save_checkpoint(task.run_id, f"checkpoint-worker-{uuid.uuid4().hex}", Stage.BATCH_REVIEW, [result_artifact["artifact_id"]], {"kind": "worker", "batch_id": batch.batch_id, "worker_id": isolated_worker_id, "proposal_present": result.proposal is not None, "review_required": result.review_required, "evidence_ledger": result.ledger})
             manager.mark(handle, "FINISHED")
             manager.remove(handle)
             return result
@@ -684,7 +707,7 @@ class RepairOrchestrator:
             "max_search_rounds": max(0, int(budget.get("max_search_rounds", self.config.budget.max_search_rounds)) - int(used.get("search_rounds", 0))),
             "max_check_runs": max(0, int(budget.get("max_check_runs", self.config.budget.max_check_runs)) - int(used.get("check_runs", 0))),
         }
-        return {"run": run, "recovery_issues": issues, "action": action, "budget_remaining": remaining, "submission_intents": [to_primitive(item) for candidate in candidates for item in self.store.list_submissions(candidate.candidate_id)]}
+        return {"run": run, "recovery_issues": issues, "action": action, "budget_remaining": remaining, "replan_of_run_id": run_id, "submission_intents": [to_primitive(item) for candidate in candidates for item in self.store.list_submissions(candidate.candidate_id)]}
 
     def gc(self, *, older_than_hours: float = 168.0, apply: bool = False, include_pending_review: bool = False) -> dict[str, Any]:
         if older_than_hours < 1:

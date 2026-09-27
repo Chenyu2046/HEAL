@@ -11,6 +11,7 @@ lives outside the packaged `src/` tree on purpose.
 
 CLI:
     py -3.13 scripts/benchmark.py context   # cache on/off efficiency run
+    py -3.13 scripts/benchmark.py dedup     # in-window read dedup on/off comparison (R3)
     py -3.13 scripts/benchmark.py recall    # File Recall@3/@5 + Symbol Recall@5
 """
 
@@ -32,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from repair_agent.agent import AgentLoop
 from repair_agent.context import ContextCache
-from repair_agent.domain import Budget, Finding, RepairTask, Severity
+from repair_agent.domain import Budget, Finding, RepairTask, Severity, to_primitive
 from repair_agent.models import ScriptedModel
 from repair_agent.runtime.workspace import WorkspaceState
 from repair_agent.tools.executor import ToolExecutor
@@ -42,6 +43,13 @@ _SCOPE_NOTE = (
     "fixture-based benchmark over deterministic synthetic C/C++ repositories; "
     "the real 800-warning dataset experiments and the three-arm A/B of 方案 §19 "
     "are notCovered (the dataset is required for those)"
+)
+
+# §3.4:上下文规模是 ESTIMATE,永不冒充 measured tokens。
+_CONTEXT_TOKEN_ESTIMATE_BASIS = (
+    "sum of UTF-8 bytes of each serialized prompt payload (task+state+observations), "
+    "same construction as models.py _prompt_token_reserve; an ESTIMATE - stdlib-only, "
+    "no tokenizer; never quote as measured tokens"
 )
 
 _METRIC_DEFINITIONS = {
@@ -317,6 +325,72 @@ def build_context_report() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------- dedup mode (R3 acceptance 4)
+
+class _CountingModel(ScriptedModel):
+    """Scripted decisions plus a per-call prompt byte measurement (§3.4 estimate)."""
+
+    def __init__(self, decisions: list[dict]) -> None:
+        super().__init__(decisions)
+        self.prompt_bytes = 0
+
+    def decide(self, task, state, observations, tools):
+        encoded = json.dumps(
+            {"task": to_primitive(task), "state": to_primitive(state), "observations": to_primitive(list(observations))},
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        self.prompt_bytes += len(encoded)
+        return super().decide(task, state, observations, tools)
+
+
+def run_dedup_arm(root: Path, *, dedup_enabled: bool) -> dict[str, Any]:
+    """Same fixture/decision sequence with dedup_recent_observations on vs off."""
+    repo, base_commit, issues, decisions = build_context_fixture(root)
+    workspace = WorkspaceState(repo, base_commit)
+    executor = ToolExecutor(workspace, search_backend="python")
+    task = RepairTask(
+        "bench-task", "bench-run", str(repo), base_commit, issues,
+        budget=Budget(max_model_calls=20, max_tool_calls=50),
+    )
+    model = _CountingModel(list(decisions))
+    loop = AgentLoop(task, worker_id="bench-worker", model=model, executor=executor, dedup_recent_observations=dedup_enabled)
+    result = loop.run("bench-batch", issues)
+    return {
+        "dedup_enabled": dedup_enabled,
+        "context_token_estimate_bytes": model.prompt_bytes,
+        "model_calls": result.usage.model_calls,
+        "repair_completed": result.proposal is not None,
+        "review_required": result.review_required,
+        "review_reason": result.reason,
+    }
+
+
+def compute_dedup_comparison(arms: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Pure aggregation over the two dedup arms (unit-tested in test_benchmark.py)."""
+    off, on = arms["dedup_off"], arms["dedup_on"]
+    return {
+        "estimate_off": off["context_token_estimate_bytes"],
+        "estimate_on": on["context_token_estimate_bytes"],
+        "estimate_decreases": on["context_token_estimate_bytes"] < off["context_token_estimate_bytes"],
+        "model_calls_equal": off["model_calls"] == on["model_calls"],
+        "repair_outcomes_identical": (off["repair_completed"], off["review_required"]) == (on["repair_completed"], on["review_required"]),
+    }
+
+
+def build_dedup_report() -> dict[str, Any]:
+    runs: dict[str, Any] = {}
+    for label, enabled in (("dedup_off", False), ("dedup_on", True)):
+        with tempfile.TemporaryDirectory() as temporary:
+            runs[label] = run_dedup_arm(Path(temporary), dedup_enabled=enabled)
+    return {
+        "scope": _SCOPE_NOTE,
+        "benchmark": "dedup",
+        "metric_definitions": {**_METRIC_DEFINITIONS, "context_token_estimate_basis": _CONTEXT_TOKEN_ESTIMATE_BASIS},
+        "runs": runs,
+        "comparison": compute_dedup_comparison(runs),
+    }
+
+
 # ---------------------------------------------------------------- recall fixture
 
 _RECALL_FILES = {
@@ -436,10 +510,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fixture-based context/recall benchmark (方案 §18); see module docstring for the notCovered scope.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("context", help="cache on/off efficiency over a scripted synthetic repair")
+    sub.add_parser("dedup", help="in-window read dedup on/off over the same scripted repair (R3)")
     sub.add_parser("recall", help="File Recall@3/@5 and Symbol Recall@5 over planted symbols")
     args = parser.parse_args(argv)
     if args.command == "context":
         report = build_context_report()
+    elif args.command == "dedup":
+        report = build_dedup_report()
     else:
         with tempfile.TemporaryDirectory() as temporary:
             report = run_recall_benchmark(Path(temporary))

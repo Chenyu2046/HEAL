@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import re
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from .domain import (
     to_primitive,
 )
 from .config import ToolLimits
-from .memory import TaskStateMemory
+from .memory import EvidenceLedger
 from .models import ModelAdapter, ModelDeadlineExceeded, ModelDecision, ModelError, ModelProtocolError, ToolCall
 from .skills import SkillContextError, SkillRouter
 from .retry import RetryPolicy
@@ -162,6 +163,10 @@ class AgentResult:
     reason: str | None
     usage: AgentUsage
     observations: tuple[Observation, ...]
+    # R2 契约变更一次性声明(§2.4):ledger 为确定性证据载荷;model_reason 属
+    # G3/R6,在此占位避免二次破坏性契约修改,本组恒为 None。
+    ledger: Mapping[str, Any] | None = None
+    model_reason: str | None = None
 
 
 class AgentLoop:
@@ -183,6 +188,9 @@ class AgentLoop:
         trace_callback: TraceCallback | None = None,
         usage_callback: UsageCallback | None = None,
         budget_started_at: float | None = None,
+        evidence_ledger_enabled: bool = True,
+        dedup_recent_observations: bool = False,
+        prior_attempt_evidence: Mapping[str, Any] | None = None,
     ) -> None:
         self.task = task
         self.worker_id = worker_id
@@ -203,12 +211,16 @@ class AgentLoop:
         self.usage_callback = usage_callback
         self.budget_started_at = budget_started_at
         self.chunk_executor = ChunkExecutor()
+        self.evidence_ledger_enabled = evidence_ledger_enabled
+        self.dedup_recent_observations = dedup_recent_observations
+        self.prior_attempt_evidence = dict(prior_attempt_evidence) if prior_attempt_evidence is not None else None
+        self._ledger: EvidenceLedger | None = None
 
     def run(self, batch_id: str, issues: Sequence[Issue]) -> AgentResult:
         self._blocking_tool_failures = []
+        self._ledger = None
         usage = AgentUsage(started_at=self.budget_started_at or time.monotonic())
         self._persist_usage(usage)
-        memory = TaskStateMemory(task_id=self.task.task_id, worker_id=self.worker_id)
         observations: list[Observation] = []
         if len({issue_id(issue) for issue in issues}) != len(issues):
             return self._review(batch_id, usage, observations, "worker requires review")
@@ -217,6 +229,8 @@ class AgentLoop:
         except SkillContextError as exc:
             reason = "skill context deadline exceeded" if "deadline" in str(exc) else "skill context limit exceeded"
             return self._review(batch_id, usage, observations, reason)
+        ledger = EvidenceLedger(task_id=self.task.task_id, worker_id=self.worker_id) if self.evidence_ledger_enabled else None
+        self._ledger = ledger
         state: dict[str, Any] = {
             "worker_id": self.worker_id,
             "batch_id": batch_id,
@@ -224,6 +238,11 @@ class AgentLoop:
             "skill_injection": skill_injection,
             "issue_ids": [issue_id(issue) for issue in issues],
         }
+        if ledger is not None:
+            state["evidence_ledger"] = ledger.to_payload()
+        if self.prior_attempt_evidence is not None:
+            # deep copy via canonical_json round-trip: the new ledger never writes into the injected copy (§2.4)
+            state["prior_attempt_evidence"] = json.loads(canonical_json(self.prior_attempt_evidence))
 
         while usage.within(self.task.budget):
             usage.model_calls += 1
@@ -294,7 +313,9 @@ class AgentLoop:
                     usage.symbol_expansions += 1
                 self._persist_usage(usage)
                 observation = self.executor.execute(decision.tool_call, expected_workspace_revision=self.executor.workspace.revision, deadline=usage.started_at + self.task.budget.max_wall_seconds)
-                self._record(observation, observations, memory, usage)
+                self._record(observation, observations, ledger, usage)
+                if ledger is not None:
+                    state["evidence_ledger"] = ledger.to_payload()
                 if decision.tool_call.name == "run_checks" and isinstance(observation.content, Mapping) and isinstance(observation.content.get("checks"), list):
                     # executed checks burn budget; pre-execution rejections carry no "checks" list and burn none
                     usage.check_runs += len(observation.content["checks"])
@@ -321,7 +342,9 @@ class AgentLoop:
                 usage.chunk_actions += len(result.completed)
                 self._persist_usage(usage)
                 for observation in (*result.completed, *result.not_executed):
-                    self._record(observation, observations, memory, usage)
+                    self._record(observation, observations, ledger, usage)
+                if ledger is not None:
+                    state["evidence_ledger"] = ledger.to_payload()
                 state["workspace_revision"] = self.executor.workspace.revision
                 if not result.accepted:
                     reason = result.reason if result.reason in _CHUNK_BUDGET_REASONS else "action chunk incomplete"
@@ -329,16 +352,19 @@ class AgentLoop:
                 continue
 
             if decision.kind == "batch_ready":
+                if ledger is not None:
+                    # batch_ready-only ingestion point; claims are redacted/bounded inside the ledger
+                    ledger.set_model_fields(decision.hypothesis, decision.next_questions, decision.attempt_summary)
                 if self._blocking_tool_failures:
                     details = ", ".join(f"{name}/{status}" for name, status in self._blocking_tool_failures[:8])
                     return self._review(batch_id, usage, observations, f"tool observation incomplete: {details}")
                 blocked = self._tool_budget_error(usage, "git_diff")
                 if blocked:
                     return self._review(batch_id, usage, observations, blocked)
-                proposal = self._proposal(batch_id, issues, decision, usage, observations)
+                proposal = self._proposal(batch_id, issues, decision, usage, observations, ledger)
                 if proposal is None:
                     return self._review(batch_id, usage, observations, self.proposal_error or "could not obtain a complete real Git diff")
-                return AgentResult(batch_id, self.worker_id, proposal, False, None, usage, tuple(observations))
+                return AgentResult(batch_id, self.worker_id, proposal, False, None, usage, tuple(observations), ledger=ledger.to_payload() if ledger is not None else None)
 
             if decision.kind == "review_required":
                 return self._review(batch_id, usage, observations, "model requested human review")
@@ -368,9 +394,11 @@ class AgentLoop:
             reasons.append("wall-clock budget exhausted")
         return self._review(batch_id, usage, observations, "; ".join(reasons) or "budget exhausted")
 
-    def _record(self, observation: Observation, observations: list[Observation], memory: TaskStateMemory, usage: AgentUsage) -> None:
+    def _record(self, observation: Observation, observations: list[Observation], ledger: EvidenceLedger | None, usage: AgentUsage) -> None:
         observations.append(observation)
-        memory.add(observation)
+        if ledger is not None:
+            # 确定性证据派生的唯一入口(§2.2):chunk observations 也经由这里进账本。
+            ledger.record(observation)
         # context_files 的精确口径:observations 里去重的证据文件数(source_paths
         # 覆盖 read/search/list_symbols/git_diff 触碰过的文件)。执行前 enforcement
         # 用的近似口径见 _tool_budget_error 注释。
@@ -461,7 +489,27 @@ class AgentLoop:
         ][-8:]
         if pinned:
             result.append({"pinned_evidence": pinned})
+        seen_reads: dict[tuple[str, int, int, str], str] = {}  # dedup key -> first occurrence's tool_call_id
         for item in observations[cutoff:]:
+            dedup_key = self._read_dedup_key(item) if self.dedup_recent_observations else None
+            if dedup_key is not None and dedup_key in seen_reads:
+                # later byte-identical read ⇒ self-describing single-hop reference (§2.6)
+                content = item.content
+                result.append({
+                    "tool_call_id": item.tool_call_id,
+                    "tool": item.tool,
+                    "status": item.status.value,
+                    "observation_ref": {
+                        "path": content.get("path"),
+                        "start_line": content.get("start_line"),
+                        "end_line": content.get("end_line"),
+                        "content_hash": content.get("content_hash"),
+                        "replays_tool_call_id": seen_reads[dedup_key],
+                    },
+                })
+                continue
+            if dedup_key is not None:
+                seen_reads[dedup_key] = item.tool_call_id
             primitive = to_primitive(item)
             content = primitive.get("content")
             content_text = canonical_json(content) if content is not None else ""
@@ -471,10 +519,29 @@ class AgentLoop:
             result.append(primitive)
         return result
 
+    @staticmethod
+    def _read_dedup_key(item: Observation) -> tuple[str, int, int, str] | None:
+        """Eligibility for in-window dedup: byte-identical read_file observations only (§2.6)."""
+        if item.tool != "read_file" or item.status != ToolStatus.OK or item.complete is not True:
+            return None
+        content = item.content
+        if not isinstance(content, Mapping):
+            return None
+        path = content.get("path")
+        start_line = content.get("start_line")
+        end_line = content.get("end_line")
+        content_hash = content.get("content_hash")
+        if not isinstance(path, str) or not path or not isinstance(start_line, int) or not isinstance(end_line, int):
+            return None
+        if not isinstance(content_hash, str) or not content_hash or not isinstance(content.get("text"), str):
+            return None
+        return (path, start_line, end_line, content_hash)
+
     def _review(self, batch_id: str, usage: AgentUsage, observations: list[Observation], reason: str) -> AgentResult:
         usage.elapsed_seconds = max(0.0, time.monotonic() - usage.started_at) if usage.started_at else 0.0
         self._persist_usage(usage)
-        return AgentResult(batch_id, self.worker_id, None, True, _safe_review_reason(reason), usage, tuple(observations))
+        ledger = self._ledger.to_payload() if self._ledger is not None else None
+        return AgentResult(batch_id, self.worker_id, None, True, _safe_review_reason(reason), usage, tuple(observations), ledger=ledger)
 
     def _skills(self, issues: Sequence[Issue], *, deadline: float | None = None) -> str:
         if self.skill_router is None:
@@ -506,12 +573,12 @@ class AgentLoop:
             actions.append(ChunkAction(str(raw["tool"]), arguments, str(raw.get("action_id", f"action-{index}")), tuple(str(item) for item in raw.get("depends_on", ()))))
         return ActionChunk(str(value.get("chunk_id", "chunk")), tuple(actions))
 
-    def _proposal(self, batch_id: str, issues: Sequence[Issue], decision: ModelDecision, usage: AgentUsage, observations: list[Observation]) -> BatchProposal | None:
+    def _proposal(self, batch_id: str, issues: Sequence[Issue], decision: ModelDecision, usage: AgentUsage, observations: list[Observation], ledger: EvidenceLedger | None = None) -> BatchProposal | None:
         diff_call = ToolCall("git_diff", {}, f"diff-{batch_id}")
         usage.tool_calls += 1
         self._persist_usage(usage)
         diff_observation = self.executor.execute(diff_call, expected_workspace_revision=self.executor.workspace.revision, deadline=usage.started_at + self.task.budget.max_wall_seconds)
-        self._record(diff_observation, observations, TaskStateMemory(self.task.task_id, self.worker_id), usage)
+        self._record(diff_observation, observations, ledger, usage)
         # The proposal must never use a model-written diff. Only the Git tool output is authoritative.
         if diff_observation.status not in {ToolStatus.OK, ToolStatus.EMPTY}:
             return None

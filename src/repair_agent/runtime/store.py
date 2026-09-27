@@ -312,6 +312,33 @@ class RunStore:
         with self._lock, self._db:
             self._db.execute("INSERT OR REPLACE INTO checkpoints(checkpoint_id, run_id, stage, artifact_ids_json, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", (checkpoint_id, run_id, stage.value, canonical_json(artifact_ids), canonical_json(sanitize(payload)), utc_now()))
 
+    def latest_worker_ledger(self, run_id: str) -> dict[str, Any] | None:
+        """Latest 'kind=worker' checkpoint payload for a run, or None.
+
+        Read-only cross-run read (tech-design §2.4); no lifecycle guard is needed
+        because checkpoint rows are immutable. Rows whose payload does not parse
+        cannot be classified and are skipped; a kind=worker payload whose
+        evidence_ledger fails the shape check raises StoreError so the caller
+        records the failure instead of silently starting cold (fail-closed).
+        """
+        with self._lock:
+            rows = self._db.execute("SELECT payload_json FROM checkpoints WHERE run_id=? ORDER BY created_at, rowid", (run_id,)).fetchall()
+        worker_payloads: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("kind") == "worker":
+                worker_payloads.append(payload)
+        if not worker_payloads:
+            return None
+        newest = worker_payloads[-1]
+        ledger = newest.get("evidence_ledger")
+        if ledger is not None and not isinstance(ledger, dict):
+            raise StoreError("worker checkpoint payload is unreadable: evidence_ledger must be an object")
+        return newest
+
     def save_candidate(self, candidate: Candidate) -> None:
         if not candidate.git_tree_oid or not candidate.candidate_commit:
             raise StoreError("candidate must carry a Git tree OID and immutable candidate commit")
