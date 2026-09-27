@@ -110,7 +110,7 @@ class RecallBenchmarkTests(unittest.TestCase):
         packet = next(item for item in first_report["per_case"] if item["query"] == "packet_send")
         self.assertEqual(packet["expected_file"], "src/net/transport.cpp")
         self.assertEqual(packet["file_rank"], 1)
-        self.assertIn("packet_send", packet["symbol_candidates"])
+        self.assertIn("net::packet_send", packet["symbol_candidates"])
 
 
 class DedupBenchmarkTests(unittest.TestCase):
@@ -148,6 +148,103 @@ class DedupBenchmarkTests(unittest.TestCase):
         self.assertTrue(comparison["model_calls_equal"])
         self.assertTrue(arms["dedup_off"]["repair_completed"])
         self.assertTrue(arms["dedup_on"]["repair_completed"])
+
+
+class RecallR4aFixtureTests(unittest.TestCase):
+    """R4a acceptance 4: the recall fixture gains plugin.h and a frames_ member_variable case."""
+
+    def test_frames_member_variable_case_hits_through_namespace_prefixing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report = benchmark.run_recall_benchmark(Path(temporary))
+        case = next(item for item in report["per_case"] if item["query"] == "frames_")
+        self.assertEqual(case["expected_file"], "src/audio/plugin.h")
+        self.assertEqual(case["file_rank"], 1)
+        self.assertTrue(case["symbol_hit_at_5"])
+        self.assertTrue(any(name.endswith("::frames_") for name in case["symbol_candidates"]))
+
+
+class SuiteBenchmarkTests(unittest.TestCase):
+    """R5a acceptance 1/2/4: three arms, deterministic metrics, pure aggregation."""
+
+    def test_compute_suite_comparison_is_pure_aggregation(self) -> None:
+        arms = {
+            "baseline": {"context_token_estimate_bytes": 900, "physical_evidence_reads": 8, "repeated_physical_reads": 3, "model_calls": 9, "repair_completed": True, "review_required": False},
+            "cache": {"context_token_estimate_bytes": 900, "physical_evidence_reads": 5, "repeated_physical_reads": 0, "model_calls": 9, "repair_completed": True, "review_required": False},
+            "ledger": {"context_token_estimate_bytes": 620, "physical_evidence_reads": 5, "repeated_physical_reads": 0, "model_calls": 9, "repair_completed": True, "review_required": False},
+        }
+        comparison = benchmark.compute_suite_comparison(arms)
+        self.assertEqual(comparison["estimate_baseline"], 900)
+        self.assertEqual(comparison["estimate_cache"], 900)
+        self.assertEqual(comparison["estimate_ledger"], 620)
+        self.assertFalse(comparison["estimate_decreases_cache_vs_baseline"])
+        # ContextCache's mechanism contribution is physical reads (zero-read replay of
+        # identical content), not prompt bytes — see compute_suite_comparison docstring
+        self.assertTrue(comparison["physical_reads_decrease_cache_vs_baseline"])
+        self.assertTrue(comparison["repeated_reads_decrease_cache_vs_baseline"])
+        self.assertTrue(comparison["model_calls_equal"])
+        self.assertTrue(comparison["both_repairs_completed"])
+        self.assertIn("delta_cache_vs_baseline", comparison)
+        self.assertIn("delta_ledger_vs_cache", comparison)
+        worse = benchmark.compute_suite_comparison({
+            "baseline": arms["baseline"],
+            "cache": {**arms["cache"], "physical_evidence_reads": 9},
+            "ledger": arms["ledger"],
+        })
+        self.assertFalse(worse["physical_reads_decrease_cache_vs_baseline"])
+
+    def test_suite_arms_are_deterministic_and_complete(self) -> None:
+        first = benchmark.build_suite_report()
+        second = benchmark.build_suite_report()
+        self.assertEqual(first["benchmark"], "suite")
+        self.assertEqual(set(first["arms"]), {"baseline", "cache", "ledger"})
+        self.assertIn("context_token_estimate_basis", first["metric_definitions"])
+        self.assertIn("notCovered", first["scope"])
+        self.assertIn("§6.9", first["arm_definitions"]["scope_note"])
+        for label, arm in first["arms"].items():
+            self.assertIn("model_calls", arm)
+            self.assertIn("tool_calls_by_name", arm)
+            # R1 landed: the suite sequence contains one run_checks self-check naming one check
+            self.assertEqual(arm["check_runs"], 1, msg=label)
+            self.assertIn("physical_evidence_reads", arm)
+            self.assertIn("distinct_files_read", arm)
+            self.assertIn("repeated_physical_reads", arm)
+            self.assertIn("logical_cache_hits", arm)
+            self.assertIn("cache_stats", arm)
+            self.assertIn("wall_seconds", arm)
+            self.assertIn("context_token_estimate_bytes", arm)
+            self.assertTrue(arm["repair_completed"], msg=label)
+            self.assertFalse(arm["review_required"], msg=label)
+        self.assertEqual(first["arms"]["baseline"]["cache_enabled"], False)
+        self.assertEqual(first["arms"]["baseline"]["ledger_enabled"], False)
+        self.assertEqual(first["arms"]["cache"]["cache_enabled"], True)
+        self.assertEqual(first["arms"]["cache"]["ledger_enabled"], False)
+        self.assertEqual(first["arms"]["ledger"]["cache_enabled"], True)
+        self.assertEqual(first["arms"]["ledger"]["ledger_enabled"], True)
+        # determinism (R5a-1, asserted over the aggregation): structure and counts are
+        # run-invariant; the byte estimate varies only by observation elapsed_ms widths
+        # (time-borne) and the fixed-width temp repo path, documented in docs/BENCHMARK.md
+        for label in first["arms"]:
+            stable = {"model_calls", "tool_calls_by_name", "check_runs", "physical_evidence_reads",
+                      "distinct_files_read", "repeated_physical_reads", "logical_cache_hits",
+                      "cache_stats", "repair_completed", "review_required"}
+            left = {k: v for k, v in first["arms"][label].items() if k in stable}
+            right = {k: v for k, v in second["arms"][label].items() if k in stable}
+            self.assertEqual(left, right, msg=label)
+            self.assertAlmostEqual(first["arms"][label]["context_token_estimate_bytes"],
+                                   second["arms"][label]["context_token_estimate_bytes"],
+                                   delta=64, msg=label)
+        self.assertEqual(benchmark.compute_suite_comparison(first["arms"]),
+                         benchmark.compute_suite_comparison(first["arms"]))
+        comparison = first["comparison"]
+        # elapsed_ms is normalized out of the estimate, so arm byte counts are deterministic:
+        # the cache arm replays identical content (equal estimate) and the ledger arm pays
+        # the injection cost in prompt bytes; the cache mechanism signal is physical reads.
+        self.assertEqual(comparison["estimate_baseline"], comparison["estimate_cache"], msg=str(comparison))
+        self.assertGreater(comparison["estimate_ledger"], comparison["estimate_cache"], msg=str(comparison))
+        self.assertTrue(comparison["physical_reads_decrease_cache_vs_baseline"], msg=str(comparison))
+        self.assertTrue(comparison["repeated_reads_decrease_cache_vs_baseline"], msg=str(comparison))
+        self.assertTrue(comparison["model_calls_equal"])
+        self.assertTrue(comparison["both_repairs_completed"])
 
 
 if __name__ == "__main__":

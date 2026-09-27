@@ -20,6 +20,7 @@ from .domain import (
     ToolStatus,
     canonical_json,
     issue_id,
+    redact_text,
     sha256_text,
     to_primitive,
 )
@@ -45,6 +46,15 @@ _CHUNK_BUDGET_REASONS = frozenset({
     "symbol expansion budget exhausted",
     "context file budget exhausted",
 })
+
+# R6:model_reason 只进诊断元数据,经单一咽喉点 redact+截断,永不进入决策路径。
+MAX_MODEL_REASON_CHARS = 1_000
+
+
+def _cap_model_reason(value: str) -> str:
+    if len(value) <= MAX_MODEL_REASON_CHARS:
+        return value
+    return value[:MAX_MODEL_REASON_CHARS] + "…[truncated]"
 
 
 def _safe_review_reason(reason: str) -> str:
@@ -363,11 +373,12 @@ class AgentLoop:
                     return self._review(batch_id, usage, observations, blocked)
                 proposal = self._proposal(batch_id, issues, decision, usage, observations, ledger)
                 if proposal is None:
-                    return self._review(batch_id, usage, observations, self.proposal_error or "could not obtain a complete real Git diff")
+                    return self._review(batch_id, usage, observations, self.proposal_error or "could not obtain a complete real Git diff", model_reason=decision.reason)
                 return AgentResult(batch_id, self.worker_id, proposal, False, None, usage, tuple(observations), ledger=ledger.to_payload() if ledger is not None else None)
 
             if decision.kind == "review_required":
-                return self._review(batch_id, usage, observations, "model requested human review")
+                # durable reason stays fixed; the model's own words ride model_reason only
+                return self._review(batch_id, usage, observations, "model requested human review", model_reason=decision.reason)
 
             return self._review(batch_id, usage, observations, "unsupported model decision")
 
@@ -537,11 +548,12 @@ class AgentLoop:
             return None
         return (path, start_line, end_line, content_hash)
 
-    def _review(self, batch_id: str, usage: AgentUsage, observations: list[Observation], reason: str) -> AgentResult:
+    def _review(self, batch_id: str, usage: AgentUsage, observations: list[Observation], reason: str, model_reason: str | None = None) -> AgentResult:
         usage.elapsed_seconds = max(0.0, time.monotonic() - usage.started_at) if usage.started_at else 0.0
         self._persist_usage(usage)
         ledger = self._ledger.to_payload() if self._ledger is not None else None
-        return AgentResult(batch_id, self.worker_id, None, True, _safe_review_reason(reason), usage, tuple(observations), ledger=ledger)
+        redacted_model_reason = _cap_model_reason(redact_text(str(model_reason))) if model_reason is not None else None
+        return AgentResult(batch_id, self.worker_id, None, True, _safe_review_reason(reason), usage, tuple(observations), ledger=ledger, model_reason=redacted_model_reason)
 
     def _skills(self, issues: Sequence[Issue], *, deadline: float | None = None) -> str:
         if self.skill_router is None:

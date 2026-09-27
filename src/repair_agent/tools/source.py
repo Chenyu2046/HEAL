@@ -187,7 +187,7 @@ class SourceTools:
     def _symbol_payload(self, relative: str, symbols: tuple[SymbolDecl, ...], content_hash: str) -> tuple[ToolStatus, Any, tuple[str, ...], dict[str, str], bool, str | None]:
         """Bound the symbol output: declaration count cap plus max_output_chars truncation."""
         decls = [
-            {"type": item.type, "name": item.name, "signature": item.signature, "start_line": item.start_line, "end_line": item.end_line}
+            {"type": item.type, "name": item.name, "signature": item.signature, "start_line": item.start_line, "end_line": item.end_line, "overload_index": item.overload_index}
             for item in symbols
         ]
         truncated = False

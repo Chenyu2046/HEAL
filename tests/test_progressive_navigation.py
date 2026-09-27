@@ -75,10 +75,11 @@ class SymbolScannerTests(unittest.TestCase):
             "};\n"
         )
         decls = scan_symbols(text)
-        self.assertEqual([item.name for item in decls], ["Audio", "Audio::reset"])
+        # R4a: member variables are now part of the outline; the initialized one kept its braces-in-string guard value.
+        self.assertEqual([item.name for item in decls], ["Audio", "Audio::open", "Audio::reset"])
         self.assertEqual(decls[0].type, "struct")
         self.assertEqual((decls[0].start_line, decls[0].end_line), (4, 7))
-        self.assertEqual((decls[1].start_line, decls[1].end_line), (6, 6))
+        self.assertEqual((decls[2].start_line, decls[2].end_line), (6, 6))
 
     def test_out_of_class_member_definition_and_free_functions(self) -> None:
         text = (
@@ -100,7 +101,8 @@ class SymbolScannerTests(unittest.TestCase):
         self.assertEqual(decls["Manager::reset"].type, "member_function")
         self.assertEqual((decls["Manager::reset"].start_line, decls["Manager::reset"].end_line), (5, 7))
         self.assertEqual(decls["free_function"].type, "function")
-        self.assertEqual(decls["nested_free"].type, "function")
+        # R4a: namespace compounding now qualifies functions contained in a namespace.
+        self.assertEqual(decls["audio::nested_free"].type, "function")
         self.assertEqual(decls["audio"].type, "namespace")
         self.assertEqual(decls["Manager::reset"].signature, "void Manager::reset()")
 
@@ -139,6 +141,114 @@ class SymbolScannerTests(unittest.TestCase):
         decl = SymbolDecl("function", "f", "void f()", 1, 1)
         with self.assertRaises(Exception):
             decl.name = "g"  # type: ignore[misc]
+
+
+class SymbolScannerR4aTests(unittest.TestCase):
+    """R4a acceptance 1-3: member variables, namespace qualification, overload indices."""
+
+    def test_member_variables_and_namespace_qualified_classes(self) -> None:
+        text = (
+            "namespace audio {\n"
+            "class Engine {\n"
+            "public:\n"
+            "    int frames_;\n"
+            "    Plugin* plugin_ = nullptr;\n"
+            "    void process();\n"
+            "};\n"
+            "}\n"
+        )
+        decls = {item.name: item for item in scan_symbols(text)}
+        # the class decl keeps its written name; its members are audio::Engine-qualified
+        self.assertEqual(decls["Engine"].type, "class")
+        frames = decls["audio::Engine::frames_"]
+        self.assertEqual(frames.type, "member_variable")
+        self.assertEqual(frames.start_line, 4)
+        self.assertEqual(decls["audio::Engine::plugin_"].type, "member_variable")
+        # prototypes and access specifiers stay invisible
+        self.assertNotIn("audio::Engine::process", decls)
+        self.assertNotIn("audio::Engine::public", decls)
+        self.assertNotIn("Engine::process", decls)
+
+    def test_qualified_types_capture_only_the_decl_name(self) -> None:
+        text = "class W {\n    std::vector<int> items_;\n    std::string name_;\n};\n"
+        names = [item.name for item in scan_symbols(text)]
+        self.assertEqual(names, ["W", "W::items_", "W::name_"])
+
+    def test_comma_declarator_captures_first_name_and_call_initializer_skips(self) -> None:
+        text = "class C {\n    int a, b;\n    Widget* w_ = make();\n    int plain_;\n};\n"
+        names = {item.name for item in scan_symbols(text)}
+        # design §3.2: comma-declarator lines capture only the first name; an
+        # initializer containing '(' is a conservative skip
+        self.assertEqual(names, {"C", "C::a", "C::plain_"})
+
+    def test_overload_indices_assigned_in_scan_order(self) -> None:
+        text = (
+            "class Sink {\n"
+            "    void write(int v) { step(v); }\n"
+            "    void write(const char* s) { step(s); }\n"
+            "};\n"
+        )
+        decls = [item for item in scan_symbols(text) if item.name == "Sink::write"]
+        self.assertEqual(len(decls), 2)
+        self.assertEqual([item.overload_index for item in decls], [1, 2])
+        unique = scan_symbols("void solo() {}\n")
+        self.assertEqual(unique[0].overload_index, 0)
+
+    def test_namespace_qualifies_contained_free_functions(self) -> None:
+        text = "namespace util {\nvoid log_write(const char* m) { (void)m; }\n}\n"
+        decls = [(item.name, item.type) for item in scan_symbols(text)]
+        self.assertEqual(decls, [("util", "namespace"), ("util::log_write", "function")])
+
+    def test_member_variable_guards(self) -> None:
+        text = (
+            "class G {\n"
+            "    void run();\n"
+            "    call_site(a);\n"
+            "    ~G();\n"
+            "    int ok_field;\n"
+            "};\n"
+        )
+        names = {item.name for item in scan_symbols(text)}
+        self.assertIn("G::ok_field", names)
+        for bad in ("G::run", "G::call_site", "G::a", "G::~G", "G::G"):
+            self.assertNotIn(bad, names)
+
+    def test_docstring_declares_member_variable_ceilings(self) -> None:
+        import repair_agent.tools.symbols as symbols_module
+
+        doc = symbols_module.__doc__ or ""
+        for marker in ("member_variable", "macros and typedefs", "comma-declarator", "initializers containing"):
+            self.assertIn(marker, doc)
+
+
+class ListSymbolsR4aToolTests(unittest.TestCase):
+    """R4a acceptance 4-5: consumers unchanged, payload emits overload_index, output bounded."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo, self.base = make_repo(Path(temporary.name))
+
+    def executor(self, *, limits: ToolLimits | None = None) -> ToolExecutor:
+        return ToolExecutor(WorkspaceState(self.repo, self.base), limits=limits, search_backend="python")
+
+    def test_payload_emits_overload_index(self) -> None:
+        (self.repo / "src" / "sink.cpp").write_text(
+            "class Sink {\n    void write(int v) {}\n    void write(const char* s) {}\n};\n",
+            encoding="utf-8",
+        )
+        result = self.executor().execute(call("list_symbols", {"path": "src/sink.cpp"}))
+        self.assertEqual(result.status, ToolStatus.OK)
+        overloads = [item for item in result.content["symbols"] if item["name"] == "Sink::write"]
+        self.assertEqual([item["overload_index"] for item in overloads], [1, 2])
+
+    def test_new_kinds_count_toward_the_same_output_caps(self) -> None:
+        many = "".join(f"void fn_{index}() {{}}\n" for index in range(600))
+        (self.repo / "src" / "many.c").write_text(many, encoding="utf-8")
+        result = self.executor(limits=ToolLimits(max_output_chars=1_000_000)).execute(call("list_symbols", {"path": "src/many.c"}))
+        self.assertEqual(result.status, ToolStatus.TRUNCATED)
+        self.assertEqual(result.complete, False)
+        self.assertEqual(len(result.content["symbols"]), 512)
 
 
 class ListSymbolsToolTests(unittest.TestCase):

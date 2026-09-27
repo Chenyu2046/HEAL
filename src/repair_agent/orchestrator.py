@@ -96,7 +96,10 @@ def _observation_trace(observation: Observation) -> dict[str, Any]:
 def _worker_result_artifact_payload(result: AgentResult) -> dict[str, Any]:
     payload = to_primitive(result)
     payload["observations"] = [_observation_trace(item) for item in result.observations]
-    payload["reason"] = None
+    # R6: keep the whitelist-safe durable reason and surface model_reason as
+    # diagnostic metadata; sanitize re-redacts everything downstream (defense in depth).
+    payload["reason"] = result.reason
+    payload["model_reason"] = result.model_reason
     return sanitize(payload)
 
 
@@ -233,10 +236,11 @@ class RepairOrchestrator:
             return self._finish_review(task.run_id, (f"worker execution failed: {type(exc).__name__}",))
         proposals = tuple(result.proposal for result in agent_results if result.proposal is not None)
         reasons = tuple(result.reason for result in agent_results if result.review_required and result.reason)
+        model_reasons = tuple(result.model_reason for result in agent_results if result.review_required and result.model_reason)
         not_executed = [observation.tool_call_id for result in agent_results for observation in result.observations if observation.status.value == "NOT_EXECUTED"]
         if reasons or len(proposals) != len(batches):
             current_budget = (self.store.get_run(task.run_id) or {}).get("budget_used", {})
-            self.store.transition(task.run_id, Stage.BATCH_REVIEW, payload_update={"worker_review_reasons": list(reasons), "not_executed": not_executed, "worktrees": worktrees, "budget_used": current_budget})
+            self.store.transition(task.run_id, Stage.BATCH_REVIEW, payload_update={"worker_review_reasons": list(reasons), "worker_model_reasons": list(model_reasons), "not_executed": not_executed, "worktrees": worktrees, "budget_used": current_budget})
             return self._finish_review(task.run_id, reasons or ("not every batch produced a complete proposal",), stage=Stage.REVIEW_REQUIRED)
 
         current_budget = (self.store.get_run(task.run_id) or {}).get("budget_used", {})
@@ -347,11 +351,15 @@ class RepairOrchestrator:
             cache = ContextCache() if self.config.context_cache_enabled else None
             # 排序上下文 = 当前 batch issues 的 symbol/module/analysis_trace 词元
             # (方案 §7);缺省(空上下文)时 search_code 不加分。
-            executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store, cache=cache, ranking_context=SearchRankingContext.from_issues(batch.issues), check_specs=self.config.checks, check_command_prefix=self.config.check_command_prefix)
+            executor = ToolExecutor(workspace, limits=self.config.tools, skill_store=skill_store, episode_store=episode_store, cache=cache, ranking_context=SearchRankingContext.from_issues(batch.issues), check_specs=self.config.checks, check_command_prefix=self.config.check_command_prefix, clangd=self.config.clangd)
             router = SkillRouter(skill_store)
             model = self.model_factory(task, isolated_worker_id)
             loop = AgentLoop(task, worker_id=isolated_worker_id, model=model, executor=executor, skill_router=router, chunking_enabled=self.config.chunking_enabled, retry_policy=RetryPolicy(self.config.model.max_retries), tool_limits=self.config.tools, max_recent_observations=self.config.max_recent_observations, max_observation_chars=self.config.max_observation_chars, max_skill_context_chars=self.config.max_skill_context_chars, max_skill_scan_bytes=self.config.max_skill_scan_bytes, trace_callback=lambda observation: self.store.record_trace(task.run_id, {"worker_id": isolated_worker_id, "batch_id": batch.batch_id, "observation": _observation_trace(observation)}), usage_callback=lambda usage: self.store.update_worker_budget(task.run_id, isolated_worker_id, to_primitive(usage)), budget_started_at=budget_started_at, evidence_ledger_enabled=self.config.evidence_ledger_enabled, dedup_recent_observations=self.config.dedup_observations_enabled, prior_attempt_evidence=prior_ledger)
-            result = loop.run(batch.batch_id, batch.issues)
+            try:
+                result = loop.run(batch.batch_id, batch.issues)
+            finally:
+                # R4b: reap the clangd server owned by this worker's executor
+                executor.close()
             self.store.record_trace(task.run_id, {"worker_id": isolated_worker_id, "batch_id": batch.batch_id, "usage": to_primitive(result.usage), "review_required": result.review_required, "reason_present": bool(result.reason)})
             result_artifact = self.store.save_artifact(task.run_id, f"worker-result-{uuid.uuid4().hex}", "worker-result", canonical_json(_worker_result_artifact_payload(result)))
             self.store.save_checkpoint(task.run_id, f"checkpoint-worker-{uuid.uuid4().hex}", Stage.BATCH_REVIEW, [result_artifact["artifact_id"]], {"kind": "worker", "batch_id": batch.batch_id, "worker_id": isolated_worker_id, "proposal_present": result.proposal is not None, "review_required": result.review_required, "evidence_ledger": result.ledger})
@@ -939,6 +947,7 @@ class RepairOrchestrator:
             "checks_not_run": checks_not_run,
             "approved_suppressions": approved_suppressions,
             "unresolved": run.get("review_reasons", run.get("worker_review_reasons", run.get("integration_conflicts", []))),
+            "worker_model_reasons": run.get("worker_model_reasons", []),
             "not_executed": run.get("not_executed", []),
             "infrastructure": run.get("failure_class") or run.get("submission_response") or run.get("ci_request"),
             "ci_dispatch": {key: run[key] for key in ("ci_dispatch_id", "ci_dispatch_state", "ci_dispatch_backend", "ci_dispatch_missing_contract", "ci_run_id") if key in run},

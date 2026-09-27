@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from ..config import CheckSpec, ToolLimits
+from ..config import CheckSpec, ClangdConfig, ToolLimits
 from ..context import ContextCache
 from ..domain import Observation, ToolStatus, canonical_json
 from ..memory import EpisodeStore
@@ -16,6 +16,7 @@ from ..models import ToolCall
 from ..runtime.workspace import WorkspaceState
 from ..skills import SkillStore
 from .checks import CheckTools
+from .clangd import ClangdNavigation
 from .edit import EditTool
 from .source import SearchRankingContext, SourceTools
 
@@ -89,6 +90,7 @@ class ToolExecutor:
         search_backend: str = "auto",
         check_specs: tuple[CheckSpec, ...] = (),
         check_command_prefix: tuple[str, ...] = (),
+        clangd: ClangdConfig | None = None,
     ) -> None:
         self.workspace = workspace
         self.limits = limits or ToolLimits()
@@ -102,15 +104,32 @@ class ToolExecutor:
         edit = EditTool(workspace, max_file_bytes=self.limits.max_file_bytes)
         self._register(ToolSpec("read_file", "Read a bounded UTF-8 source range.", True, ("path",), True, {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}, "max_chars": {"type": "integer", "minimum": 1}}), source.read_file)
         self._register(ToolSpec("search_code", "Text search only; not complete C++ semantic navigation.", True, ("query",), True, {"query": {"type": "string", "minLength": 1}, "paths": {"type": "array", "items": {"type": "string"}}, "max_results": {"type": "integer", "minimum": 1}}), source.search_code)
-        self._register(ToolSpec("list_symbols", "Heuristic lexical C/C++ symbol outline of one file (namespaces/classes/member functions with line ranges); comments, macros, and templates are unreliable, and this is not semantic navigation.", True, ("path",), True, {"path": {"type": "string"}}), source.list_symbols)
-        self._register(ToolSpec("find_definition", "Semantic definition lookup when clangd is configured.", True, ("symbol",), True, {"symbol": {"type": "string"}}), source.unsupported_navigation)
-        self._register(ToolSpec("find_references", "Semantic reference lookup when clangd is configured.", True, ("symbol",), True, {"symbol": {"type": "string"}}), source.unsupported_navigation)
+        self._register(ToolSpec("list_symbols", "Heuristic lexical C/C++ symbol outline of one file (namespaces/classes/member functions/member variables with line ranges, plus overload ordinals); comments, macros, and templates are unreliable, and this is not semantic navigation.", True, ("path",), True, {"path": {"type": "string"}}), source.list_symbols)
+        self._register(ToolSpec("find_definition", "Semantic definition lookup when clangd is configured.", True, ("symbol",), False, {"symbol": {"type": "string"}}), self._find_definition)
+        self._register(ToolSpec("find_references", "Semantic reference lookup when clangd is configured.", True, ("symbol",), False, {"symbol": {"type": "string"}}), self._find_references)
         self._register(ToolSpec("edit_file", "Replace one uniquely matched old text after hash validation.", False, ("path", "expected_hash", "old_text", "new_text"), False, {"path": {"type": "string"}, "expected_hash": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}), edit.edit_file)
         self._register(ToolSpec("git_diff", "Read the actual Git working-tree diff.", True), source.git_diff)
         self._register(ToolSpec("read_guideline", "Read a versioned Skill guideline.", True, ("skill_id",), True, {"skill_id": {"type": "string"}}), self._read_guideline)
         self._register(ToolSpec("memory_retrieve", "Retrieve historical repair episodes with lexical confidence checks against the current workspace; results are provenance-bound and ranked by structured scoring.", True, (), False, {"repo": {"type": "string"}, "module": {"type": "string"}, "rule": {"type": "string"}, "keywords": {"type": "array", "items": {"type": "string"}}, "symbol": {"type": "string"}, "source_commit": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 10}}), self._memory_retrieve)
         # registered unconditionally so the schema is stable across configurations (tech-design §1.3)
         self._register(ToolSpec("run_checks", "Run configured trusted checks by name; the verdict comes from the exit code only. Checks are configuration data; they cannot be defined or redefined from here.", False, ("names",), False, {"names": {"type": "array", "items": {"type": "string"}}}), CheckTools(workspace, check_specs, check_command_prefix, self.limits).run_checks)
+        # R4b: server lifecycle state makes chunk-replay unsafe, hence allowed_in_chunk=False
+        self._clangd = ClangdNavigation(workspace, clangd, max_output_chars=self.limits.max_output_chars) if clangd is not None else None
+
+    def close(self) -> None:
+        """Reap owned background processes (clangd); safe to call more than once."""
+        if self._clangd is not None:
+            self._clangd.close()
+
+    def _find_definition(self, arguments: dict[str, Any]) -> tuple[ToolStatus, Any, tuple[str, ...], dict[str, str], bool, str | None]:
+        if self._clangd is None:
+            return ToolStatus.UNSUPPORTED, None, (), {}, False, "clangd/compile_commands semantic navigation is not configured"
+        return self._clangd.find_definition(str(arguments.get("symbol", "")), deadline=arguments.get("_deadline"))
+
+    def _find_references(self, arguments: dict[str, Any]) -> tuple[ToolStatus, Any, tuple[str, ...], dict[str, str], bool, str | None]:
+        if self._clangd is None:
+            return ToolStatus.UNSUPPORTED, None, (), {}, False, "clangd/compile_commands semantic navigation is not configured"
+        return self._clangd.find_references(str(arguments.get("symbol", "")), deadline=arguments.get("_deadline"))
 
     def _register(self, spec: ToolSpec, handler: Handler) -> None:
         self.registry.register(spec)

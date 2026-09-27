@@ -7,16 +7,22 @@ partial specializations, typedef chains, raw string literals, operator
 overloads, and declaration-spanning macros are unreliable or unsupported.
 Line ranges come from brace pairing over cleaned text in which comments,
 string/char literals, and preprocessor lines are blanked first, so braces
-inside comments and strings never break the structure. Upgrade path: replace
-this module with a tree-sitter or clangd/compile_commands backed extractor
-behind the same ``SymbolDecl`` contract (方案 §4.3, Phase 2).
+inside comments and strings never break the structure.
+
+R4a ceilings for ``member_variable`` (tech-design §3.2): macros and typedefs can
+create false ``member_variable`` positives/negatives; comma-declarator lines
+(``int a, b;``) capture only the first name; initializers containing ``(``
+cause a conservative skip; template-heavy member declarations may be mis-bounded;
+template recognition stays best-effort. Upgrade path: replace this module with a
+tree-sitter or clangd/compile_commands backed extractor behind the same
+``SymbolDecl`` contract (方案 §4.3, Phase 2).
 """
 
 from __future__ import annotations
 
 import re
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 SIGNATURE_MAX_CHARS = 160
 # list_symbols 输出条数上限;工具层据此对超限结果给出 TRUNCATED(扫描器本身不截断)。
@@ -38,6 +44,7 @@ class SymbolDecl:
     signature: str
     start_line: int
     end_line: int
+    overload_index: int = 0  # 1-based ordinal among same (type, name) decls in scan order; 0 = unique
 
 
 def _blank_preprocessor(cleaned: str) -> str:
@@ -306,7 +313,7 @@ def _try_type_decl(cleaned: str, kw_start: int, keyword: str, end: int, line_sta
     return None
 
 
-def _try_function(cleaned: str, ident_start: int, ident_end: int, ident: str, end: int, enclosing: str | None, line_starts: tuple[int, ...]):
+def _try_function(cleaned: str, ident_start: int, ident_end: int, ident: str, end: int, enclosing: str | None, line_starts: tuple[int, ...], enclosing_kind: str | None = None):
     """Match ``[Qual] Name(args) [quals|: init|-> ret] {``; calls/prototypes return None."""
     if ident in _CONTROL_KEYWORDS:
         return None
@@ -329,7 +336,7 @@ def _try_function(cleaned: str, ident_start: int, ident_end: int, ident: str, en
                 kind = "member_function"
             elif enclosing:
                 name = f"{enclosing}::{name}"
-                kind = "member_function"
+                kind = "member_function" if enclosing_kind == "class" else "function"
             else:
                 kind = "function"
             return body_close, _make_decl(kind, name, cleaned, sig_from, k, body_close, line_starts)
@@ -358,11 +365,92 @@ def _try_function(cleaned: str, ident_start: int, ident_end: int, ident: str, en
     return None
 
 
+def _try_member_variable(cleaned: str, ident_start: int, ident_end: int, ident: str, end: int, enclosing: str | None, line_starts: tuple[int, ...]):
+    """Match ``Type name ['[' … ']' | '…'] ['=' initializer] ';'`` inside a class body (R4a).
+
+    Anchored on the NAME candidate: after the name only brackets, a comma
+    continuation, an ellipsis, or a ``(``-free initializer may appear before the
+    terminating ``;`` — any ``(``, ``:``, ``{``, ``}``, ``}``, or a further
+    identifier rejects the attempt (member functions, calls, bit-fields after
+    access-specifier-like labels, and qualified type segments stay excluded).
+    Returns ``(terminate_offset, SymbolDecl)`` or ``None``.
+    """
+    if enclosing is None:
+        return None
+    if ident in _CONTROL_KEYWORDS or ident in _TYPE_KEYWORDS:
+        return None
+    j = _skip_ws(cleaned, ident_end, end)
+    steps = 0
+    while j < end and steps < 512:
+        steps += 1
+        c = cleaned[j]
+        if c == ";":
+            sig_from = line_starts[_line_of(line_starts, ident_start) - 1]
+            return j, _make_decl("member_variable", f"{enclosing}::{ident}", cleaned, sig_from, ident_start, j, line_starts)
+        if c == ",":
+            # comma-declarator: capture only the first name; skip to the shared ';'
+            k = j + 1
+            while k < end and cleaned[k] not in ";\n":
+                if cleaned[k] in "({":
+                    return None
+                k += 1
+            if k >= end or cleaned[k] != ";":
+                return None
+            sig_from = line_starts[_line_of(line_starts, ident_start) - 1]
+            return k, _make_decl("member_variable", f"{enclosing}::{ident}", cleaned, sig_from, ident_start, k, line_starts)
+        if c in "():{}" or cleaned.startswith("~", j):
+            return None
+        if c == "[":
+            close = cleaned.find("]", j, end)
+            if close < 0:
+                return None
+            j = close + 1
+            continue
+        if c == "=":
+            # initializer: conservative — any '(' makes this a call/lambda, skip entirely
+            k = j + 1
+            while k < end and cleaned[k] not in ";\n":
+                if cleaned[k] == "(":
+                    return None
+                k += 1
+            if k >= end or cleaned[k] != ";":
+                return None
+            sig_from = line_starts[_line_of(line_starts, ident_start) - 1]
+            return k, _make_decl("member_variable", f"{enclosing}::{ident}", cleaned, sig_from, ident_start, k, line_starts)
+        if cleaned[j].isalnum() or cleaned[j] == "_":
+            return None  # a further identifier means this one was part of the type
+        j += 1
+    return None
+
+
+def _compound(prefix: str | None, name: str) -> str:
+    return f"{prefix}::{name}" if prefix else name
+
+
+def _assign_overload_indices(decls: list[SymbolDecl]) -> list[SymbolDecl]:
+    """Post-pass: 1..n ordinal among same (type, name) groups in scan order; unique keeps 0."""
+    counts: dict[tuple[str, str], int] = {}
+    for decl in decls:
+        key = (decl.type, decl.name)
+        counts[key] = counts.get(key, 0) + 1
+    result: list[SymbolDecl] = []
+    seen: dict[tuple[str, str], int] = {}
+    for decl in decls:
+        key = (decl.type, decl.name)
+        if counts[key] > 1:
+            seen[key] = seen.get(key, 0) + 1
+            result.append(replace(decl, overload_index=seen[key]))
+        else:
+            result.append(decl)
+    return result
+
+
 def scan_symbols(text: str) -> tuple[SymbolDecl, ...]:
     """Return the lexical symbol outline of a C/C++ source text.
 
-    类/结构体体内递归识别成员函数;类外 ``Class::method`` 定义按书写的限定名识别。
-    未闭合的花括号按区域结尾截断(预处理器条件不可靠的天花板之一)。
+    类/结构体体内递归识别成员函数与成员变量;类外 ``Class::method`` 定义按书写的
+    限定名识别;命名空间现在按 R4a 复合前缀限定其包含的自由函数。未闭合的花括号
+    按区域结尾截断(预处理器条件不可靠的天花板之一)。
     """
     cleaned = _strip_comments_and_literals(text)
     line_starts_list = [0]
@@ -371,11 +459,11 @@ def scan_symbols(text: str) -> tuple[SymbolDecl, ...]:
             line_starts_list.append(index + 1)
     line_starts = tuple(line_starts_list)
     decls: list[SymbolDecl] = []
-    _scan(cleaned, 0, len(cleaned), None, line_starts, decls)
-    return tuple(decls)
+    _scan(cleaned, 0, len(cleaned), None, line_starts, decls, None)
+    return tuple(_assign_overload_indices(decls))
 
 
-def _scan(cleaned: str, start: int, end: int, enclosing: str | None, line_starts: tuple[int, ...], decls: list[SymbolDecl]) -> None:
+def _scan(cleaned: str, start: int, end: int, enclosing: str | None, line_starts: tuple[int, ...], decls: list[SymbolDecl], enclosing_kind: str | None = None) -> None:
     i = start
     while i < end:
         c = cleaned[i]
@@ -397,16 +485,28 @@ def _scan(cleaned: str, start: int, end: int, enclosing: str | None, line_starts
             if matched is not None:
                 body_open, body_close, decl = matched
                 decls.append(decl)
-                nested = decl.name if decl.type in {"class", "struct"} and not decl.name.startswith("<") else enclosing
-                _scan(cleaned, body_open + 1, body_close, nested, line_starts, decls)
+                if decl.type in {"class", "struct"} and not decl.name.startswith("<"):
+                    nested, nested_kind = _compound(enclosing, decl.name), "class"
+                elif decl.type == "namespace" and not decl.name.startswith("<"):
+                    nested, nested_kind = _compound(enclosing, decl.name), "namespace"
+                else:  # enums and anonymous aggregates keep the outer frame
+                    nested, nested_kind = enclosing, enclosing_kind
+                _scan(cleaned, body_open + 1, body_close, nested, line_starts, decls, nested_kind)
                 i = body_close + 1
                 continue
             i = m.end()
             continue
-        matched = _try_function(cleaned, ident_start, m.end(), ident, end, enclosing, line_starts)
+        matched = _try_function(cleaned, ident_start, m.end(), ident, end, enclosing, line_starts, enclosing_kind)
         if matched is not None:
             body_close, decl = matched
             decls.append(decl)
             i = body_close + 1
             continue
+        if not destructor and enclosing_kind == "class":
+            matched = _try_member_variable(cleaned, ident_start, m.end(), ident, end, enclosing, line_starts)
+            if matched is not None:
+                body_close, decl = matched
+                decls.append(decl)
+                i = body_close + 1
+                continue
         i = m.end()

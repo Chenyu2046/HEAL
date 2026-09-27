@@ -57,6 +57,23 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class ClangdConfig:
+    """R4b: semantic navigation adapter configuration; absent ⇒ both tools stay UNSUPPORTED."""
+
+    binary: str                    # path or name resolved via shutil.which at executor construction
+    compile_commands_dir: str      # workspace-relative location of compile_commands.json
+    timeout_seconds: float = 10.0  # per-request and handshake bound
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binary, str) or not self.binary.strip():
+            raise ConfigError("clangd binary must be a non-empty string")
+        if not isinstance(self.compile_commands_dir, str) or not self.compile_commands_dir:
+            raise ConfigError("clangd compile_commands_dir must be a non-empty string")
+        if not self.timeout_seconds > 0:
+            raise ConfigError("clangd timeout_seconds must be positive")
+
+
+@dataclass(frozen=True)
 class Config:
     version: str = "1"
     mode: str = "local-demo"
@@ -80,6 +97,7 @@ class Config:
     check_command_prefix: tuple[str, ...] = ()  # optional trusted prefix (tech-design §1.6)
     evidence_ledger_enabled: bool = True        # R2 rollback switch (tech-design §2.1)
     dedup_observations_enabled: bool = False    # R3 switch; changes prompt semantics, default off (§2.6)
+    clangd: ClangdConfig | None = None          # R4b activation surface; the entire switch (§3.3)
 
     def __post_init__(self) -> None:
         if self.mode not in {"local-demo", "simulated-enterprise", "enterprise"}:
@@ -136,6 +154,20 @@ def _check_prefix(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _clangd(value: Any) -> ClangdConfig | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ConfigError("clangd must be an object with binary and compile_commands_dir")
+    binary = value.get("binary")
+    compile_commands_dir = value.get("compile_commands_dir")
+    if not isinstance(binary, str) or not binary:
+        raise ConfigError("clangd binary must be a non-empty string")
+    if not isinstance(compile_commands_dir, str) or not compile_commands_dir:
+        raise ConfigError("clangd compile_commands_dir must be a non-empty string")
+    return ClangdConfig(binary=binary, compile_commands_dir=compile_commands_dir, timeout_seconds=float(value.get("timeout_seconds", 10.0)))
+
+
 def _load_mapping(path: Path) -> Mapping[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -187,4 +219,5 @@ def load_config(path: str | Path | None = None) -> Config:
         check_command_prefix=check_prefix,
         evidence_ledger_enabled=bool(raw.get("evidence_ledger_enabled", True)),
         dedup_observations_enabled=bool(raw.get("dedup_observations_enabled", False)),
+        clangd=_clangd(raw.get("clangd")),
     )

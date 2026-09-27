@@ -32,6 +32,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from repair_agent.agent import AgentLoop
+from repair_agent.config import CheckSpec
 from repair_agent.context import ContextCache
 from repair_agent.domain import Budget, Finding, RepairTask, Severity, to_primitive
 from repair_agent.models import ScriptedModel
@@ -48,8 +49,9 @@ _SCOPE_NOTE = (
 # §3.4:上下文规模是 ESTIMATE,永不冒充 measured tokens。
 _CONTEXT_TOKEN_ESTIMATE_BASIS = (
     "sum of UTF-8 bytes of each serialized prompt payload (task+state+observations), "
-    "same construction as models.py _prompt_token_reserve; an ESTIMATE - stdlib-only, "
-    "no tokenizer; never quote as measured tokens"
+    "same construction as models.py _prompt_token_reserve, with observation elapsed_ms "
+    "normalized to 0 during measurement (time-borne field, excluded so arm comparisons "
+    "are deterministic); an ESTIMATE - stdlib-only, no tokenizer; never quote as measured tokens"
 )
 
 _METRIC_DEFINITIONS = {
@@ -328,15 +330,23 @@ def build_context_report() -> dict[str, Any]:
 # ---------------------------------------------------------------- dedup mode (R3 acceptance 4)
 
 class _CountingModel(ScriptedModel):
-    """Scripted decisions plus a per-call prompt byte measurement (§3.4 estimate)."""
+    """Scripted decisions plus a per-call prompt byte measurement (§3.4 estimate).
+
+    测量口径:observation 的 elapsed_ms 是时间量,测量时归一为 0,否则臂间比较
+    会被毫秒位宽噪声淹没(见 basis 文本);其余负载逐字节如实计入。
+    """
 
     def __init__(self, decisions: list[dict]) -> None:
         super().__init__(decisions)
         self.prompt_bytes = 0
 
     def decide(self, task, state, observations, tools):
+        normalized = [
+            dict(item, elapsed_ms=0) if isinstance(item, dict) and "elapsed_ms" in item else item
+            for item in observations
+        ]
         encoded = json.dumps(
-            {"task": to_primitive(task), "state": to_primitive(state), "observations": to_primitive(list(observations))},
+            {"task": to_primitive(task), "state": to_primitive(state), "observations": to_primitive(normalized)},
             ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
         self.prompt_bytes += len(encoded)
@@ -391,6 +401,121 @@ def build_dedup_report() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------- suite mode (R5a)
+
+_SUITE_ARM_DEFINITIONS = {
+    "scope_note": (
+        "three arms isolate single mechanism contributions over one shared scripted decision "
+        "sequence; this is NOT the 方案 §19 A/B (whose third arm is the full HEAL bundle) — §6.9 "
+        "honest-labeling deviation carried from requirements; navigation is common to all arms "
+        "and chunking (default-off) is not an arm"
+    ),
+    "baseline": "cache off, ledger off — the raw loop",
+    "cache": "cache on, ledger off — isolates the ContextCache effect",
+    "ledger": "cache on, ledger on — isolates the Task-Memory injection effect",
+}
+
+
+def build_suite_fixture(root: Path) -> tuple[Path, str, tuple[Finding, ...], list[dict]]:
+    """The context fixture plus one configured run_checks self-check in the sequence (R1 landed)."""
+    repo, base_commit, issues, decisions = build_context_fixture(root)
+    # run the deterministic self-check after the edit, before batch_ready
+    decisions.insert(
+        len(decisions) - 1,
+        {"kind": "tool_call", "tool_call": {"name": "run_checks", "arguments": {"names": ["self_check"]}}},
+    )
+    # determinism: uuid-defaulted tool_call ids would otherwise leak into the byte estimate
+    for index, decision in enumerate(decisions):
+        call = decision.get("tool_call")
+        if isinstance(call, dict) and "call_id" not in call:
+            call["call_id"] = f"bench-call-{index}"
+    return repo, base_commit, issues, decisions
+
+
+def run_suite_arm(root: Path, *, cache_enabled: bool, ledger_enabled: bool) -> dict[str, Any]:
+    repo, base_commit, issues, decisions = build_suite_fixture(root)
+    cache = ContextCache() if cache_enabled else None
+    workspace = WorkspaceState(repo, base_commit)
+    executor = ToolExecutor(
+        workspace, cache=cache, search_backend="python",
+        check_specs=(CheckSpec("self_check", (sys.executable, "-c", "import sys; sys.exit(0)")),),
+    )
+    task = RepairTask(
+        "bench-task", "bench-run", str(repo), base_commit, issues,
+        budget=Budget(max_model_calls=20, max_tool_calls=50),
+    )
+    model = _CountingModel(list(decisions))
+    loop = AgentLoop(task, worker_id="bench-worker", model=model, executor=executor, evidence_ledger_enabled=ledger_enabled)
+    counter = _EvidenceReadCounter()
+    started = time.perf_counter()
+    with counter:
+        result = loop.run("bench-batch", issues)
+    wall_seconds = time.perf_counter() - started
+    tool_calls_by_name: dict[str, int] = {}
+    for observation in result.observations:
+        tool_calls_by_name[observation.tool] = tool_calls_by_name.get(observation.tool, 0) + 1
+    summary = counter.summary()
+    return {
+        "cache_enabled": cache_enabled,
+        "ledger_enabled": ledger_enabled,
+        "model_calls": result.usage.model_calls,
+        "tool_calls_by_name": dict(sorted(tool_calls_by_name.items())),
+        "check_runs": result.usage.check_runs,
+        "physical_evidence_reads": summary["physical_evidence_reads"],
+        "distinct_files_read": summary["distinct_files_read"],
+        "repeated_physical_reads": summary["repeated_physical_reads"],
+        "logical_cache_hits": sum(v for k, v in cache.stats().items() if k.endswith("_hits")) if cache is not None else 0,
+        "cache_stats": cache.stats() if cache is not None else None,
+        "wall_seconds": round(wall_seconds, 3),
+        "repair_completed": result.proposal is not None,
+        "review_required": result.review_required,
+        "review_reason": result.reason,
+        "context_token_estimate_bytes": model.prompt_bytes,
+    }
+
+
+def compute_suite_comparison(arms: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Pure aggregation over the three suite arms (unit-tested in test_benchmark.py).
+
+    ContextCache 的机制贡献在物理读取(零读取重放),不在 prompt 字节:重放返回
+    与首次相同的内容,estimate_cache 与 estimate_baseline 结构性相等,所以
+    estimate_decreases_cache_vs_baseline 按如实布尔报告;cache 机制对比看
+    physical/repeated reads 字段。
+    """
+    baseline, cache, ledger = arms["baseline"], arms["cache"], arms["ledger"]
+    return {
+        "estimate_baseline": baseline["context_token_estimate_bytes"],
+        "estimate_cache": cache["context_token_estimate_bytes"],
+        "estimate_ledger": ledger["context_token_estimate_bytes"],
+        "delta_cache_vs_baseline": cache["context_token_estimate_bytes"] - baseline["context_token_estimate_bytes"],
+        "delta_ledger_vs_cache": ledger["context_token_estimate_bytes"] - cache["context_token_estimate_bytes"],
+        "estimate_decreases_cache_vs_baseline": cache["context_token_estimate_bytes"] < baseline["context_token_estimate_bytes"],
+        "physical_reads_decrease_cache_vs_baseline": cache["physical_evidence_reads"] < baseline["physical_evidence_reads"],
+        "repeated_reads_decrease_cache_vs_baseline": cache["repeated_physical_reads"] < baseline["repeated_physical_reads"],
+        "model_calls_equal": baseline["model_calls"] == cache["model_calls"] == ledger["model_calls"],
+        "both_repairs_completed": baseline["repair_completed"] and cache["repair_completed"] and ledger["repair_completed"],
+    }
+
+
+def build_suite_report() -> dict[str, Any]:
+    arms: dict[str, Any] = {}
+    for label, cache_enabled, ledger_enabled in (
+        ("baseline", False, False),
+        ("cache", True, False),
+        ("ledger", True, True),
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            arms[label] = run_suite_arm(Path(temporary), cache_enabled=cache_enabled, ledger_enabled=ledger_enabled)
+    return {
+        "scope": _SCOPE_NOTE,
+        "benchmark": "suite",
+        "metric_definitions": {**_METRIC_DEFINITIONS, "context_token_estimate_basis": _CONTEXT_TOKEN_ESTIMATE_BASIS},
+        "arm_definitions": _SUITE_ARM_DEFINITIONS,
+        "arms": arms,
+        "comparison": compute_suite_comparison(arms),
+    }
+
+
 # ---------------------------------------------------------------- recall fixture
 
 _RECALL_FILES = {
@@ -398,6 +523,11 @@ _RECALL_FILES = {
         '#include "manager.h"\n\nnamespace audio {\n\n'
         "Plugin* AudioManager::getPlugin() {\n    return plugin_;\n}\n\n"
         "void AudioManager::process() {\n    Plugin* plugin = getPlugin();\n    if (plugin) {\n        plugin->load();\n    }\n}\n\n}\n"
+    ),
+    "src/audio/plugin.h": (
+        "#ifndef AUDIO_PLUGIN_H\n#define AUDIO_PLUGIN_H\n\nnamespace audio {\n\n"
+        "class Plugin {\npublic:\n    void load();\n    void unload();\n    int frames() const;\n\nprivate:\n"
+        "    int frames_;\n};\n\n}\n\n#endif\n"
     ),
     "src/audio/plugin.cpp": (
         '#include "plugin.h"\n\nnamespace audio {\n\nvoid Plugin::load() {\n    frames_ = 64;\n}\n\n'
@@ -429,6 +559,7 @@ class RecallCase:
 
 RECALL_CASES: tuple[RecallCase, ...] = (
     RecallCase("getPlugin", "src/audio/manager.cpp", "getPlugin", ranking_files=("src/audio/manager.cpp",)),
+    RecallCase("frames_", "src/audio/plugin.h", "frames_", ranking_files=("src/audio/plugin.h",)),
     RecallCase("packet_send", "src/net/transport.cpp", "packet_send"),
     RecallCase("log_write", "src/util/logger.cpp", "log_write"),
     RecallCase("unload", "src/audio/plugin.cpp", "unload"),
@@ -511,12 +642,15 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("context", help="cache on/off efficiency over a scripted synthetic repair")
     sub.add_parser("dedup", help="in-window read dedup on/off over the same scripted repair (R3)")
+    sub.add_parser("suite", help="baseline/cache/ledger three-arm mechanism comparison (R5a)")
     sub.add_parser("recall", help="File Recall@3/@5 and Symbol Recall@5 over planted symbols")
     args = parser.parse_args(argv)
     if args.command == "context":
         report = build_context_report()
     elif args.command == "dedup":
         report = build_dedup_report()
+    elif args.command == "suite":
+        report = build_suite_report()
     else:
         with tempfile.TemporaryDirectory() as temporary:
             report = run_recall_benchmark(Path(temporary))

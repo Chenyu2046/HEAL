@@ -595,7 +595,10 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(persisted_observation["error_present"])
         self.assertNotIn("content", persisted_observation)
         self.assertNotIn("error", persisted_observation)
-        self.assertIsNone(json.loads(serialized)["reason"])
+        # R6: the artifact stops hard-stripping the durable reason (whitelist-safe by
+        # construction in the real flow) and adds model_reason alongside it.
+        self.assertEqual(json.loads(serialized)["reason"], "HTTP body with unmarked secret")
+        self.assertIsNone(json.loads(serialized)["model_reason"])
 
     def test_ci_accumulator_serializes_conflicting_cross_connection_callbacks(self) -> None:
         with temp_workspace(self) as temporary:

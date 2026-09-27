@@ -32,7 +32,9 @@ class ChunkResult:
 
 
 class BoundaryDetector:
-    READ_ONLY_TOOLS = frozenset({"read_file", "search_code", "list_symbols", "find_definition", "find_references", "read_guideline", "memory_retrieve"})
+    # R4b: find_definition/find_references dropped — read-only on paper, but server
+    # lifecycle state makes chunk-replay semantics unsafe (tech-design §3.3).
+    READ_ONLY_TOOLS = frozenset({"read_file", "search_code", "list_symbols", "read_guideline", "memory_retrieve"})
     STOP_STATUSES = frozenset({ToolStatus.EMPTY, ToolStatus.AMBIGUOUS, ToolStatus.PARTIAL, ToolStatus.TRUNCATED, ToolStatus.VERSION_CHANGED, ToolStatus.UNSUPPORTED, ToolStatus.ERROR})
 
     def validate(self, chunk: ActionChunk, registry: Any) -> str | None:

@@ -58,6 +58,7 @@ class ReportWriter:
             ("Validation pending / partial", "validation_pending"),
             ("Approved suppression candidates", "approved_suppressions"),
             ("Unresolved", "unresolved"),
+            ("Worker model reasons (diagnostic)", "worker_model_reasons"),
             ("Not executed", "not_executed"),
             ("Checks not run", "checks_not_run"),
             ("Infrastructure / configuration", "infrastructure"),
