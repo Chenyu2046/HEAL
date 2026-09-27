@@ -66,6 +66,10 @@ class ModelDecision:
     reason: str | None = None
     action_map: Mapping[str, str] = field(default_factory=dict)
     usage: ModelUsage = field(default_factory=ModelUsage)
+    # R2:batch_ready 专有的可选陈述字段,缺省保持既有决策全部合法(向后兼容)。
+    hypothesis: str = ""
+    next_questions: tuple[str, ...] = ()
+    attempt_summary: str = ""
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ModelDecision":
@@ -101,8 +105,31 @@ class ModelDecision:
             action_map = value.get("action_map", {})
             if not isinstance(action_map, Mapping):
                 raise ModelProtocolError("action_map must be an object")
-            return cls(kind=kind, reason=str(value.get("reason", "")) or None, action_map={str(k): str(v) for k, v in action_map.items()}, usage=usage)
+            hypothesis, next_questions, attempt_summary = "", (), ""
+            if kind == "batch_ready":
+                hypothesis = cls._optional_text(value, "hypothesis")
+                next_questions = cls._optional_questions(value)
+                attempt_summary = cls._optional_text(value, "attempt_summary")
+            return cls(kind=kind, reason=str(value.get("reason", "")) or None, action_map={str(k): str(v) for k, v in action_map.items()}, usage=usage, hypothesis=hypothesis, next_questions=next_questions, attempt_summary=attempt_summary)
         raise ModelProtocolError(f"unsupported model decision kind: {kind!r}")
+
+    @staticmethod
+    def _optional_text(value: Mapping[str, Any], key: str) -> str:
+        raw = value.get(key)
+        if raw is None:
+            return ""
+        if not isinstance(raw, str):
+            raise ModelProtocolError(f"batch_ready {key} must be a string")
+        return raw
+
+    @staticmethod
+    def _optional_questions(value: Mapping[str, Any]) -> tuple[str, ...]:
+        raw = value.get("next_questions")
+        if raw is None:
+            return ()
+        if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+            raise ModelProtocolError("batch_ready next_questions must be a list of strings")
+        return tuple(raw)
 
 
 class ModelAdapter(ABC):

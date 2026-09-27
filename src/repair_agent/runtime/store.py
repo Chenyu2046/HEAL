@@ -42,14 +42,14 @@ _TRANSITIONS: dict[Stage, set[Stage]] = {
     Stage.REPAIRING: {Stage.BATCH_REVIEW, Stage.REVIEW_REQUIRED, Stage.FAILED},
     Stage.BATCH_REVIEW: {Stage.INTEGRATING, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.FAILED},
     Stage.INTEGRATING: {Stage.CANDIDATE_FROZEN, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.FAILED},
-    Stage.CANDIDATE_FROZEN: {Stage.HUMAN_REVIEW, Stage.REPAIRING, Stage.REVIEW_REQUIRED},
-    Stage.HUMAN_REVIEW: {Stage.SUBMITTING, Stage.REPAIRING, Stage.REVIEW_REQUIRED},
+    Stage.CANDIDATE_FROZEN: {Stage.HUMAN_REVIEW, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.RETRY_INFRA},
+    Stage.HUMAN_REVIEW: {Stage.SUBMITTING, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.RETRY_INFRA},
     Stage.SUBMITTING: {Stage.CI_DISPATCHING, Stage.SUBMISSION_UNKNOWN, Stage.REVIEW_REQUIRED, Stage.FAILED},
     Stage.SUBMISSION_UNKNOWN: {Stage.SUBMITTING, Stage.CI_DISPATCHING, Stage.HUMAN_REVIEW, Stage.REVIEW_REQUIRED},
     Stage.CI_DISPATCHING: {Stage.CI_PENDING, Stage.CI_DISPATCH_UNKNOWN, Stage.RETRY_INFRA, Stage.REVIEW_REQUIRED},
     Stage.CI_DISPATCH_UNKNOWN: {Stage.CI_DISPATCHING, Stage.CI_PENDING, Stage.REVIEW_REQUIRED},
     Stage.CI_PENDING: {Stage.VERIFIED, Stage.REPAIRING, Stage.RETRY_INFRA, Stage.REVIEW_REQUIRED, Stage.FAILED},
-    Stage.RETRY_INFRA: {Stage.CI_DISPATCHING, Stage.CI_PENDING, Stage.VERIFIED, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.FAILED},
+    Stage.RETRY_INFRA: {Stage.CI_DISPATCHING, Stage.CI_PENDING, Stage.VERIFIED, Stage.HUMAN_REVIEW, Stage.REPAIRING, Stage.REVIEW_REQUIRED, Stage.FAILED},
     Stage.VERIFIED: {Stage.REVIEW_REQUIRED},
     Stage.REVIEW_REQUIRED: {Stage.REPAIRING, Stage.HUMAN_REVIEW, Stage.VERIFIED, Stage.RETRY_INFRA, Stage.FAILED},
     Stage.FAILED: {Stage.REPAIRING, Stage.REVIEW_REQUIRED},
@@ -199,7 +199,7 @@ class RunStore:
     def update_worker_budget(self, run_id: str, worker_id: str, usage: Mapping[str, Any]) -> dict[str, int | float | bool]:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", worker_id):
             raise StoreError("worker usage key is invalid")
-        fields = ("model_calls", "model_attempts", "model_retries", "tool_calls", "tokens", "edit_attempts", "chunk_actions", "changed_files", "diff_lines")
+        fields = ("model_calls", "model_attempts", "model_retries", "tool_calls", "tokens", "edit_attempts", "chunk_actions", "changed_files", "diff_lines", "search_rounds", "symbol_expansions", "context_files", "check_runs")
         snapshot: dict[str, int | float | bool] = {key: max(0, int(usage.get(key, 0))) for key in fields}
         snapshot["elapsed_seconds"] = max(0.0, float(usage.get("elapsed_seconds", 0.0)))
         snapshot["token_usage_known"] = bool(usage.get("token_usage_known", True))
@@ -300,9 +300,44 @@ class RunStore:
             self._db.execute("INSERT OR REPLACE INTO artifacts(artifact_id, run_id, kind, path, sha256, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (artifact_id, run_id, kind, str(target), digest, canonical_json(metadata or {}), utc_now()))
         return record
 
+    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        """Artifact record lookup (path + sha256); content integrity is the caller's check."""
+        with self._lock:
+            row = self._db.execute("SELECT artifact_id, run_id, kind, path, sha256, metadata_json, created_at FROM artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
+            if row is None:
+                return None
+            return {"artifact_id": row["artifact_id"], "run_id": row["run_id"], "kind": row["kind"], "path": row["path"], "sha256": row["sha256"], "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]}
+
     def save_checkpoint(self, run_id: str, checkpoint_id: str, stage: Stage, artifact_ids: list[str], payload: Mapping[str, Any]) -> None:
         with self._lock, self._db:
             self._db.execute("INSERT OR REPLACE INTO checkpoints(checkpoint_id, run_id, stage, artifact_ids_json, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", (checkpoint_id, run_id, stage.value, canonical_json(artifact_ids), canonical_json(sanitize(payload)), utc_now()))
+
+    def latest_worker_ledger(self, run_id: str) -> dict[str, Any] | None:
+        """Latest 'kind=worker' checkpoint payload for a run, or None.
+
+        Read-only cross-run read (tech-design §2.4); no lifecycle guard is needed
+        because checkpoint rows are immutable. Rows whose payload does not parse
+        cannot be classified and are skipped; a kind=worker payload whose
+        evidence_ledger fails the shape check raises StoreError so the caller
+        records the failure instead of silently starting cold (fail-closed).
+        """
+        with self._lock:
+            rows = self._db.execute("SELECT payload_json FROM checkpoints WHERE run_id=? ORDER BY created_at, rowid", (run_id,)).fetchall()
+        worker_payloads: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("kind") == "worker":
+                worker_payloads.append(payload)
+        if not worker_payloads:
+            return None
+        newest = worker_payloads[-1]
+        ledger = newest.get("evidence_ledger")
+        if ledger is not None and not isinstance(ledger, dict):
+            raise StoreError("worker checkpoint payload is unreadable: evidence_ledger must be an object")
+        return newest
 
     def save_candidate(self, candidate: Candidate) -> None:
         if not candidate.git_tree_oid or not candidate.candidate_commit:
@@ -567,6 +602,67 @@ class RunStore:
                 persisted = self._persist_validation_locked(result)
                 self._db.commit()
                 return persisted
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def save_local_validation_and_transition(
+        self,
+        result: ValidationResult,
+        *,
+        run_id: str,
+        payload_update: Mapping[str, Any] | None = None,
+    ) -> tuple[ValidationResult, Stage]:
+        """Persist local validation evidence and its candidate-bound run state atomically."""
+        if result.state != ValidationState.FINAL or result.backend.lower() != "local":
+            raise StoreError("local transition requires a final local validation result")
+        target_by_class = {
+            ValidationClass.VALIDATION_PASS: Stage.HUMAN_REVIEW,
+            ValidationClass.CODE_FAIL: Stage.REPAIRING,
+            ValidationClass.INFRA_FAIL: Stage.RETRY_INFRA,
+            ValidationClass.INCONCLUSIVE: Stage.REVIEW_REQUIRED,
+        }
+        failure_by_class = {
+            ValidationClass.CODE_FAIL: "CODE_FAIL",
+            ValidationClass.INFRA_FAIL: "INFRA_FAIL",
+            ValidationClass.INCONCLUSIVE: "INCONCLUSIVE",
+        }
+        allowed_stages = {Stage.CANDIDATE_FROZEN, Stage.HUMAN_REVIEW, Stage.REVIEW_REQUIRED, Stage.RETRY_INFRA}
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                candidate = self.get_candidate(result.candidate_id)
+                if candidate is None or candidate.run_id != run_id:
+                    raise StoreError("local validation run does not match candidate")
+                row = self._db.execute("SELECT stage,payload_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                if row is None:
+                    raise StoreError(f"run not found: {run_id}")
+                current = Stage(row["stage"])
+                payload = json.loads(row["payload_json"])
+                if current not in allowed_stages:
+                    raise StoreError(f"local validation cannot update run from stage {current.value}")
+                if payload.get("candidate_id") != result.candidate_id:
+                    raise StoreError("local validation does not match the run's current candidate")
+                if result.classification == ValidationClass.CODE_FAIL and not (payload_update or {}).get("new_attempt_id"):
+                    raise StoreError("code-failing local validation requires a new attempt id")
+                persisted = self._persist_validation_locked(result)
+                target = target_by_class[persisted.classification]
+                if target != current and target not in _TRANSITIONS.get(current, set()):
+                    raise StoreError(f"invalid local validation transition {current.value} -> {target.value}")
+                payload.update(sanitize(payload_update or {}))
+                payload["validation_id"] = persisted.validation_id
+                payload["validation_backend"] = persisted.backend
+                failure = failure_by_class.get(persisted.classification)
+                if failure:
+                    payload["failure_class"] = failure
+                else:
+                    payload.pop("failure_class", None)
+                self._db.execute(
+                    "UPDATE runs SET stage=?,payload_json=?,updated_at=? WHERE run_id=?",
+                    (target.value, canonical_json(sanitize(payload)), utc_now(), run_id),
+                )
+                self._db.commit()
+                return persisted, target
             except Exception:
                 self._db.rollback()
                 raise

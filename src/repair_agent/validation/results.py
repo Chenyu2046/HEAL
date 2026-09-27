@@ -13,7 +13,7 @@ from ..runtime.trace import sanitize
 @dataclass(frozen=True)
 class ValidationPolicy:
     required_checks: tuple[str, ...] = ("build", "ut", "scan")
-    allow_simulated: bool = True
+    allow_simulated: bool = False
 
 
 class IndependentValidator:
@@ -50,7 +50,7 @@ class IndependentValidator:
             classification = ValidationClass.VALIDATION_PASS
         if str(checks.get("workspace_integrity", "PASS")).upper() not in {"PASS", "VALIDATION_PASS"}:
             classification = ValidationClass.INCONCLUSIVE
-        if backend.lower() in {"simulated", "scripted"} and classification == ValidationClass.VALIDATION_PASS:
+        if not self.policy.allow_simulated and backend.lower() in {"simulated", "scripted"} and classification == ValidationClass.VALIDATION_PASS:
             classification = ValidationClass.INCONCLUSIVE
         return ValidationResult(
             validation_id=f"validation-{uuid.uuid4().hex}",

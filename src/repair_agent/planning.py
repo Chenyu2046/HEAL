@@ -101,6 +101,10 @@ class InputNormalizer:
             "max_wall_seconds": (default_budget or Budget()).max_wall_seconds,
             "max_edit_attempts": (default_budget or Budget()).max_edit_attempts,
             "max_chunk_actions": (default_budget or Budget()).max_chunk_actions,
+            "max_context_files": (default_budget or Budget()).max_context_files,
+            "max_symbol_expansions": (default_budget or Budget()).max_symbol_expansions,
+            "max_search_rounds": (default_budget or Budget()).max_search_rounds,
+            "max_check_runs": (default_budget or Budget()).max_check_runs,
         }
         resolved_budget.update(raw_budget)
         resolved_budget.update({key: value for key, value in (cli_budget_overrides or {}).items() if value is not None})
@@ -118,6 +122,10 @@ class InputNormalizer:
                 max_wall_seconds=float(resolved_budget["max_wall_seconds"]),
                 max_edit_attempts=int(resolved_budget["max_edit_attempts"]),
                 max_chunk_actions=int(resolved_budget["max_chunk_actions"]),
+                max_context_files=int(resolved_budget["max_context_files"]),
+                max_symbol_expansions=int(resolved_budget["max_symbol_expansions"]),
+                max_search_rounds=int(resolved_budget["max_search_rounds"]),
+                max_check_runs=int(resolved_budget["max_check_runs"]),
             ),
             mode=str(payload.get("mode", default_mode)),
             model_id=str(payload.get("model_id", default_model_id)),
